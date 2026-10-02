@@ -20,6 +20,11 @@ import {
   VIDEO_LIST_MAX_LIMIT,
   WORKSPACE_NAME_MAX_LENGTH,
   COLLECTION_ITEMS_PAGE_MAX,
+  FEEDBACK_LIST_PAGE_MAX,
+  FEEDBACK_MESSAGE_MAX_LENGTH,
+  FEEDBACK_REQUEST_TYPES,
+  FEEDBACK_RESOLUTION_NOTE_MAX_LENGTH,
+  FEEDBACK_STATUSES,
   type AddGalleryVideosRequest,
   type CollectionActivityResponse,
   type CollectionItemListResponse,
@@ -28,6 +33,8 @@ import {
   type CollectionSchemaChangeResponse,
   type CollectionSchemaResponse,
   type CreateGalleryCategoryRequest,
+  type FeedbackMessageSummary,
+  type FeedbackRequestDetail,
   type GalleryCategorySummary,
   type GalleryDetail,
   type GalleryListResponse,
@@ -38,6 +45,7 @@ import {
   type PublicApiSite,
   type PublicApiSitesResponse,
   type PublicApiVideoEmbedResponse,
+  type PublicFeedbackListResponse,
   type UpdateGalleryRequest,
   type UsageSummaryResponse,
   type VideoListResponse,
@@ -64,6 +72,7 @@ import { ConfigError, configDirectory, currentPlatformContext, LOGIN_COMMAND, re
 import { CredentialsError, credentialsPath, resolveCredentials, type ResolvedCredentials } from "./credentials.js";
 import { showcaseEmbedResult, videoEmbedResult } from "./embed.js";
 import { describeError, UserFacingError } from "./errors.js";
+import { FEEDBACK_TOOL_GUIDANCE, feedbackDetailResult, feedbackListResult, feedbackPath } from "./feedback.js";
 import { formatBytes, truncateList } from "./format.js";
 import { deriveIdempotencyKey } from "./idempotency.js";
 import { planMigration } from "./migration-plan.js";
@@ -103,7 +112,15 @@ Collections (structured content like menus, inventory, and events that clients e
 - Run plan_collections first (it never saves), show the summary to the user, and only call apply_collection_plan after their explicit confirmation. Pass confirmDestructive: true only after they agree to every change marked destructive.
 - ${COLLECTION_EDIT_RULES.keepKeys}
 - Import items with add_collection_items and dryRun: true first; fix or report per-item errors before saving.
-- ${COLLECTION_EDIT_RULES.useCode}`;
+- ${COLLECTION_EDIT_RULES.useCode}
+
+Feedback (requests clients leave on their website). To fix the open Dropl feedback:
+1. list_sites to find the site, then list_feedback (open and in progress by default).
+2. get_feedback for each request: page, element selector and nearby text, device, screenshot, and the thread.
+3. ${FEEDBACK_TOOL_GUIDANCE.textChanges}
+4. ${FEEDBACK_TOOL_GUIDANCE.ambiguous}
+5. ${FEEDBACK_TOOL_GUIDANCE.markDone}
+Tell the user which requests you fixed, which you asked about, and which you skipped.`;
 
 const CONFIRM_FIRST = "Only call after showing the plan to the user and getting explicit confirmation.";
 
@@ -830,6 +847,87 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
         const entry = pickUndoableActivity(await client.get<CollectionActivityResponse>(`${collectionPath(collectionId)}/activity`), activityId);
         const result = await client.post<CollectionSchemaChangeResponse>(`${collectionPath(collectionId)}/activity/${pathSegment(entry.id)}/undo`, {});
         return { undone: entry.summary, changes: result.changes, schemaVersion: result.collection.schemaVersion };
+      }),
+  );
+
+  server.registerTool(
+    "list_feedback",
+    {
+      title: "List client feedback",
+      description: `Lists feedback the client left on their website (comments on elements, text changes, general notes), newest first. Defaults to open and in progress. ${FEEDBACK_TOOL_GUIDANCE.textChanges} Use get_feedback for the full context of one request.`,
+      inputSchema: {
+        siteId: idSchema("Client site id (from list_sites)."),
+        status: z.array(z.enum(FEEDBACK_STATUSES)).min(1).max(FEEDBACK_STATUSES.length).optional().describe("Defaults to open and in_progress."),
+        type: z.enum(FEEDBACK_REQUEST_TYPES).optional(),
+        page: z.string().trim().max(200).optional().describe("Only requests on pages whose path contains this, e.g. /menu."),
+        limit: z.number().int().min(1).max(FEEDBACK_LIST_PAGE_MAX).optional(),
+        offset: z.number().int().min(0).optional(),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    ({ siteId, status, type, page, limit, offset }) =>
+      run("list_feedback", async () => {
+        const { client } = await connect();
+        const query = { status: (status ?? ["open", "in_progress"]).join(","), type, page, limit, offset };
+        return feedbackListResult(await client.get<PublicFeedbackListResponse>(`${sitePath(siteId)}/feedback`, { query }), offset ?? 0);
+      }),
+  );
+
+  server.registerTool(
+    "get_feedback",
+    {
+      title: "Get client feedback",
+      description: `Gets one feedback request with its full context: page URL, the clicked element (CSS selector, tag, nearby text, position), device and viewport, screenshot and photo URLs (temporary; fetch them to look), and the thread. ${FEEDBACK_TOOL_GUIDANCE.textChanges} ${FEEDBACK_TOOL_GUIDANCE.ambiguous}`,
+      inputSchema: { requestId: idSchema("Feedback request id (from list_feedback).") },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    ({ requestId }) =>
+      run("get_feedback", async () => {
+        const { client } = await connect();
+        return feedbackDetailResult(await client.get<FeedbackRequestDetail>(feedbackPath(requestId)));
+      }),
+  );
+
+  server.registerTool(
+    "reply_to_feedback",
+    {
+      title: "Reply to client feedback",
+      description: `Replies in a feedback request's thread as the signed-in user; the client gets the reply by email. ${FEEDBACK_TOOL_GUIDANCE.ambiguous} Keep replies short and plain (no code). Safe to retry: the same reply isn't posted twice.`,
+      inputSchema: {
+        requestId: idSchema("Feedback request id (from list_feedback)."),
+        message: z.string().trim().min(1).max(FEEDBACK_MESSAGE_MAX_LENGTH),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    ({ requestId, message }) =>
+      run("reply_to_feedback", async () => {
+        const { client } = await connect();
+        const body = { message };
+        const response = await client.request<FeedbackMessageSummary>("POST", `${feedbackPath(requestId)}/replies`, {
+          body,
+          idempotencyKey: deriveIdempotencyKey("feedback.reply", requestId, body),
+        });
+        return { replied: true, messageId: response.data.id, alreadySent: response.replayed };
+      }),
+  );
+
+  server.registerTool(
+    "update_feedback_status",
+    {
+      title: "Update feedback status",
+      description: `Sets a feedback request to open, in_progress, done, or wont_do. ${FEEDBACK_TOOL_GUIDANCE.markDone} Marking done emails the client; only mark done once the fix is in the code (and deployed, if the user says so).`,
+      inputSchema: {
+        requestId: idSchema("Feedback request id (from list_feedback)."),
+        status: z.enum(FEEDBACK_STATUSES),
+        resolutionNote: z.string().trim().max(FEEDBACK_RESOLUTION_NOTE_MAX_LENGTH).optional().describe("Short note for done or wont_do, e.g. \"Updated the opening hours on the contact page.\""),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    ({ requestId, status, resolutionNote }) =>
+      run("update_feedback_status", async () => {
+        const { client } = await connect();
+        const request = await client.patch<FeedbackRequestDetail>(feedbackPath(requestId), { status, resolutionNote: resolutionNote ?? null });
+        return { id: request.id, number: request.number, status: request.status, resolutionNote: request.resolutionNote, clientNotified: status === "done" };
       }),
   );
 

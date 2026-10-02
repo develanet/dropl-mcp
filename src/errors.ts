@@ -1,4 +1,4 @@
-import { PUBLIC_API_ERROR_CODES } from "@dropl/shared";
+import { FEEDBACK_PLAN_REQUIRED_CODE, PUBLIC_API_ERROR_CODES } from "@dropl/shared";
 import { LOGIN_COMMAND, API_KEY_ENV } from "./config.js";
 
 export const NETWORK_ERROR_CODE = "NETWORK_ERROR";
@@ -38,7 +38,17 @@ const HINTS_BY_CODE: Record<string, string> = {
   COLLECTION_FULL: "This collection holds its maximum number of items. Tell the user; don't split it on your own.",
   COLLECTION_LIMIT_REACHED: "The site has as many collections as its plan allows. Tell the user, or reuse an existing collection.",
   UNDO_NOT_AVAILABLE: "Only the most recent schema change can be undone, and only while no data written since then would be lost. Tell the user what changed instead.",
+  [FEEDBACK_PLAN_REQUIRED_CODE]: "The account's plan doesn't include this. Tell the user; they can upgrade under Billing in the Dropl dashboard. Don't retry.",
+  FEEDBACK_CHANGED: "Someone changed this request's status since you read it. Run get_feedback again and check with the user before changing it.",
 };
+
+/** Keys made before Feedback existed lack its scopes; signing in again issues a key with every scope. */
+const FEEDBACK_SCOPE_HINT = `This key was created before Feedback was available. Ask the user to run \`${LOGIN_COMMAND}\` in a terminal to sign in again (the new key includes the feedback scopes), then retry. Never ask them to paste a key into the chat.`;
+
+function hintFor(error: DroplApiError): string | undefined {
+  if (error.code === PUBLIC_API_ERROR_CODES.insufficientScope && error.message.includes("feedback:")) return FEEDBACK_SCOPE_HINT;
+  return HINTS_BY_CODE[error.code];
+}
 
 /** One line for the agent: the API's message verbatim, its code, and what to do about it. */
 export function describeError(error: unknown): string {
@@ -50,7 +60,7 @@ export function describeError(error: unknown): string {
         .map(([field, messages]) => `${field}: ${messages.join(", ")}`);
       if (fieldMessages.length > 0) parts.push(`Fields: ${fieldMessages.join("; ")}`);
     }
-    const hint = HINTS_BY_CODE[error.code];
+    const hint = hintFor(error);
     if (hint) parts.push(hint);
     return parts.join(" ");
   }

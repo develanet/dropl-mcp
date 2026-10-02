@@ -3,6 +3,9 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import {
   slugifyCategoryName,
+  type FeedbackAttachmentSummary,
+  type FeedbackMessageSummary,
+  type FeedbackRequestDetail,
   type GalleryCategorySummary,
   type GalleryDetail,
   type GalleryImageSummary,
@@ -26,6 +29,67 @@ const MOCK_COLLECTION_FIELDS = [
   { key: "name", label: "Name", type: "short_text", required: true, helpText: null, options: null, min: null, max: null, currency: null },
   { key: "price", label: "Price", type: "price", required: false, helpText: null, options: null, min: null, max: null, currency: "USD" },
 ];
+
+export const MOCK_FEEDBACK_ID = "fb1";
+const MOCK_SCREENSHOT: FeedbackAttachmentSummary = {
+  id: "att1",
+  purpose: "screenshot",
+  status: "ready",
+  previewUrl: "https://cdn.example.com/att1-preview.webp",
+  largeUrl: "https://cdn.example.com/att1-large.webp",
+  width: 1280,
+  height: 720,
+  fileName: "screenshot.png",
+  createdAt: "2026-10-01T00:00:00.000Z",
+};
+
+function mockFeedbackRequest(): FeedbackRequestDetail {
+  return {
+    id: MOCK_FEEDBACK_ID,
+    number: 7,
+    site: { id: "site1", name: "Acme" },
+    type: "text_change",
+    imageAction: null,
+    status: "open",
+    message: null,
+    pageUrl: "https://acme.example.com/contact",
+    pagePath: "/contact",
+    pageTitle: "Contact",
+    currentText: "Open 9-5",
+    requestedText: "Open 8-6",
+    requester: { userId: "client1", name: "Cleo Client", isTeam: false },
+    deviceType: "mobile",
+    screenshot: MOCK_SCREENSHOT,
+    replyCount: 0,
+    createdAt: "2026-10-01T00:00:00.000Z",
+    updatedAt: "2026-10-01T00:00:00.000Z",
+    lastActivityAt: "2026-10-01T00:00:00.000Z",
+    element: {
+      selector: "main > p:nth-of-type(2)",
+      tagName: "p",
+      textHint: "Open 9-5",
+      rect: { x: 10, y: 20, width: 300, height: 24 },
+      documentRect: { x: 10, y: 820, width: 300, height: 24 },
+      imageSrc: null,
+    },
+    context: {
+      deviceType: "mobile",
+      browser: "Safari 18",
+      os: "iOS 18",
+      viewport: { width: 390, height: 844 },
+      screen: { width: 390, height: 844 },
+      devicePixelRatio: 3,
+      scroll: { x: 0, y: 800 },
+      language: "en-US",
+      userAgent: null,
+    },
+    resolutionNote: null,
+    resolvedAt: null,
+    attachments: [MOCK_SCREENSHOT],
+    messages: [],
+    allowedStatuses: ["open", "in_progress", "done", "wont_do"],
+  };
+}
 
 export interface StoragePutRecord {
   path: string;
@@ -97,6 +161,7 @@ export class MockDroplApi {
   private readonly photoBytes = new Map<string, number>();
   readonly collectionItems: { values: Record<string, unknown>; status: string }[] = [];
   collectionActivityUndoable = true;
+  readonly feedbackRequest = mockFeedbackRequest();
   partSizeBytes = 1024;
   deviceScript: DeviceStep[] = ["success"];
   deviceInterval = 5;
@@ -444,7 +509,36 @@ export class MockDroplApi {
         updatedAt: null,
       }];
     }
-    return this.routeCollections(method, path, body) ?? notFound;
+    return this.routeCollections(method, path, body) ?? this.routeFeedback(method, path, body) ?? notFound;
+  }
+
+  private routeFeedback(method: string, path: string, body: any): [number, unknown] | null {
+    if (method === "GET" && path === "/v1/sites/site1/feedback") return [200, { requests: [this.feedbackRequest], total: 3 }];
+    const feedbackMatch = /^\/v1\/feedback\/([^/]+)(\/replies)?$/.exec(path);
+    if (!feedbackMatch) return null;
+    if (feedbackMatch[1] !== MOCK_FEEDBACK_ID) return [404, { error: { code: "NOT_FOUND", message: "Feedback request not found." } }];
+    const request = this.feedbackRequest;
+    if (method === "GET" && !feedbackMatch[2]) return [200, request];
+    if (method === "POST" && feedbackMatch[2]) {
+      const message: FeedbackMessageSummary = {
+        id: nextId("msg"),
+        kind: "reply",
+        author: { userId: "user1", name: "Owner", isTeam: true },
+        body: body.message,
+        statusFrom: null,
+        statusTo: null,
+        attachments: [],
+        createdAt: "2026-10-02T00:00:00.000Z",
+      };
+      request.messages.push(message);
+      return [201, message];
+    }
+    if (method === "PATCH" && !feedbackMatch[2]) {
+      request.status = body.status;
+      request.resolutionNote = body.resolutionNote ?? null;
+      return [200, request];
+    }
+    return null;
   }
 
   private routeCollections(method: string, path: string, body: any): [number, unknown] | null {

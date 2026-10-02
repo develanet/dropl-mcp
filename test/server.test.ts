@@ -30,6 +30,10 @@ const EXPECTED_TOOLS = [
   "list_collection_items",
   "get_collection_code",
   "undo_collection_change",
+  "list_feedback",
+  "get_feedback",
+  "reply_to_feedback",
+  "update_feedback_status",
 ];
 
 interface TextResult {

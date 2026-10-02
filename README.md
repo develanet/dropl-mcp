@@ -4,7 +4,8 @@ An [MCP](https://modelcontextprotocol.io) server that lets AI coding agents (Cur
 
 - create a client site and a showcase (an embeddable photo/video gallery),
 - upload photos and videos from your computer, organized into categories from your folders,
-- fetch the official embed code and paste it into the project you're building.
+- fetch the official embed code and paste it into the project you're building,
+- work through the feedback clients leave on their website: fix it in the code, reply, and mark it done.
 
 Uploads go straight from your computer to Dropl's storage, are resumable, and are safe to re-run. The agent is told to show you a plan and get your confirmation before it creates anything or uploads.
 
@@ -111,8 +112,14 @@ Use a stdio server with command `npx` and arguments `["-y", "@dropl/mcp"]`. Add 
 | `list_collection_items` | List items with search, status and field filters, sorting, and paging. |
 | `get_collection_code` | TypeScript types and a Next.js fetch example for a collection. |
 | `undo_collection_change` | Undo the most recent schema change when no data would be lost. |
+| `list_feedback` | Feedback clients left on a site (comments, text changes, notes). Defaults to open and in progress; filter by status, type, and page. |
+| `get_feedback` | One request with its full context: page, clicked element (selector and text), device, screenshot and photos, and the thread. |
+| `reply_to_feedback` | Reply in a request's thread, e.g. to ask the client to clarify. The client is emailed; retries don't post twice. |
+| `update_feedback_status` | Set open, in progress, done, or won't do, with a short note. Marking done emails the client. |
 
 Collections need an API key with the `collections:read` scope to read, `collections:write` to add items, and `collections:schema` to create or change collections.
+
+Feedback needs `feedback:read` to read and `feedback:write` to reply or change status. Keys created before Feedback existed don't have these scopes; run `npx -y @dropl/mcp login` again to get a new key. Ask your agent to *"fix the open Dropl feedback"*: it reads each request, applies text changes in the code, asks the client when something is unclear, and marks the fixed ones done.
 
 Supported uploads: JPEG, PNG, WebP, AVIF, and HEIC photos up to 20 MB each, checked by file contents as well as extension. MP4, MOV, WebM, MKV, AVI, MPEG, and M4V videos. Hidden files are skipped. Symlinks that point outside the folder being uploaded are not followed.
 
