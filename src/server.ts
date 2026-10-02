@@ -392,6 +392,7 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
             layout: gallery.layout,
             itemCount: gallery.itemCount,
             videoCount: gallery.videoCount,
+            ...(gallery.isPrivate === true ? { private: true, note: "Private client photos from feedback: never public and can't be embedded." } : {}),
             updatedAt: gallery.updatedAt,
           })),
           nextCursor: response.nextCursor,

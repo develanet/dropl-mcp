@@ -197,6 +197,7 @@ export class MockDroplApi {
       itemCount: 0,
       videoCount: 0,
       coverUrl: null,
+      isPrivate: false,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       deletedAt: null,

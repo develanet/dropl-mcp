@@ -1,6 +1,6 @@
 {
   "name": "@dropl/mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "MCP server that lets AI coding agents create Dropl client sites and showcases, upload photos and videos, and fetch embed code.",
   "license": "MIT",
   "type": "module",

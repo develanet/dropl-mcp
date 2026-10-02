@@ -1,4 +1,4 @@
-import { FEEDBACK_PLAN_REQUIRED_CODE, PUBLIC_API_ERROR_CODES } from "@dropl/shared";
+import { FEEDBACK_PLAN_REQUIRED_CODE, PUBLIC_API_ERROR_CODES, SHOWCASE_PRIVATE_CODE } from "@dropl/shared";
 import { LOGIN_COMMAND, API_KEY_ENV } from "./config.js";
 
 export const NETWORK_ERROR_CODE = "NETWORK_ERROR";
@@ -39,6 +39,7 @@ const HINTS_BY_CODE: Record<string, string> = {
   COLLECTION_LIMIT_REACHED: "The site has as many collections as its plan allows. Tell the user, or reuse an existing collection.",
   UNDO_NOT_AVAILABLE: "Only the most recent schema change can be undone, and only while no data written since then would be lost. Tell the user what changed instead.",
   [FEEDBACK_PLAN_REQUIRED_CODE]: "The account's plan doesn't include this. Tell the user; they can upgrade under Billing in the Dropl dashboard. Don't retry.",
+  [SHOWCASE_PRIVATE_CODE]: "This showcase holds private client photos and is never public. Don't embed it or write embed HTML for it; to use a photo on the website, ask the user to add it to another showcase.",
   FEEDBACK_CHANGED: "Someone changed this request's status since you read it. Run get_feedback again and check with the user before changing it.",
 };
 
