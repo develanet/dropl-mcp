@@ -5,7 +5,7 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "dropl-mcp": "./dist/cli.js"
+    "dropl-mcp": "dist/cli.js"
   },
   "files": [
     "dist",
