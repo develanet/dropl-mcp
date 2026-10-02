@@ -1,0 +1,9 @@
+{
+  "extends": "@dropl/typescript-config/node.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": ["src", "test", "tsup.config.ts", "vitest.config.ts"]
+}
