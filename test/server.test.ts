@@ -22,6 +22,14 @@ const EXPECTED_TOOLS = [
   "get_embed_code",
   "get_usage",
   "plan_migration",
+  "list_collections",
+  "get_collection_schema",
+  "plan_collections",
+  "apply_collection_plan",
+  "add_collection_items",
+  "list_collection_items",
+  "get_collection_code",
+  "undo_collection_change",
 ];
 
 interface TextResult {

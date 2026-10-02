@@ -104,6 +104,15 @@ Use a stdio server with command `npx` and arguments `["-y", "@dropl/mcp"]`. Add 
 | `add_videos_to_showcase` | Add existing library videos to a showcase. |
 | `get_embed_code` | The embed snippet for a video or a showcase (or one category), plus how to paste it in HTML, React/Next.js, WordPress, Webflow, and Framer. |
 | `get_usage` | Storage and bandwidth used against your plan, and whether uploads are suspended. |
+| `list_collections` | A site's collections (menus, inventory, events) with item counts and plan limits. |
+| `get_collection_schema` | A collection's current fields and `schemaVersion`, including edits made in the dashboard. |
+| `plan_collections` / `apply_collection_plan` | Preview creating or changing collections as a plain-text diff, then apply it. Destructive changes need `confirmDestructive`; plans made from an outdated schema are refused. |
+| `add_collection_items` | Bulk-add items with per-item errors. Dry runs by default; retries don't duplicate. |
+| `list_collection_items` | List items with search, status and field filters, sorting, and paging. |
+| `get_collection_code` | TypeScript types and a Next.js fetch example for a collection. |
+| `undo_collection_change` | Undo the most recent schema change when no data would be lost. |
+
+Collections need an API key with the `collections:read` scope to read, `collections:write` to add items, and `collections:schema` to create or change collections.
 
 Supported uploads: JPEG, PNG, WebP, AVIF, and HEIC photos up to 20 MB each, checked by file contents as well as extension. MP4, MOV, WebM, MKV, AVI, MPEG, and M4V videos. Hidden files are skipped. Symlinks that point outside the folder being uploaded are not followed.
 

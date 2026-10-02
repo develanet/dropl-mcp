@@ -32,6 +32,12 @@ const HINTS_BY_CODE: Record<string, string> = {
   [PUBLIC_API_ERROR_CODES.siteRestrictedKey]: "This key is limited to specific client sites. Ask the user to pick one of the sites from list_sites, or to use a key with access to every site.",
   SUBSCRIPTION_REQUIRED: "The account needs an active plan. Ask the user to check Billing in the Dropl dashboard.",
   GALLERY_FULL: "Create another showcase for the remaining items.",
+  SCHEMA_CHANGED: "Someone changed this collection since you read it. Run get_collection_schema again, rebuild the plan from the current fields, and show the new diff to the user. Never undo their edits.",
+  CONFIRMATION_REQUIRED: "This change loses data or renames something websites rely on. Show the diff to the user and only retry with confirmDestructive: true after they explicitly agree.",
+  ITEM_LIMIT_REACHED: "The account is out of collection items on its plan. Tell the user; they can upgrade or buy an item add-on under Billing.",
+  COLLECTION_FULL: "This collection holds its maximum number of items. Tell the user; don't split it on your own.",
+  COLLECTION_LIMIT_REACHED: "The site has as many collections as its plan allows. Tell the user, or reuse an existing collection.",
+  UNDO_NOT_AVAILABLE: "Only the most recent schema change can be undone, and only while no data written since then would be lost. Tell the user what changed instead.",
 };
 
 /** One line for the agent: the API's message verbatim, its code, and what to do about it. */

@@ -17,7 +17,15 @@ export interface RecordedRequest {
   path: string;
   headers: http.IncomingHttpHeaders;
   body: any;
+  query: URLSearchParams;
 }
+
+/** A menu collection with one undoable schema change; items without a `name` are invalid. */
+export const MOCK_COLLECTION_ID = "col1";
+const MOCK_COLLECTION_FIELDS = [
+  { key: "name", label: "Name", type: "short_text", required: true, helpText: null, options: null, min: null, max: null, currency: null },
+  { key: "price", label: "Price", type: "price", required: false, helpText: null, options: null, min: null, max: null, currency: "USD" },
+];
 
 export interface StoragePutRecord {
   path: string;
@@ -87,6 +95,8 @@ export class MockDroplApi {
   readonly sessions = new Map<string, VideoSession>();
   readonly videos = new Map<string, { id: string; publicId: string; title: string; deletedAt: string | null }>();
   private readonly photoBytes = new Map<string, number>();
+  readonly collectionItems: { values: Record<string, unknown>; status: string }[] = [];
+  collectionActivityUndoable = true;
   partSizeBytes = 1024;
   deviceScript: DeviceStep[] = ["success"];
   deviceInterval = 5;
@@ -162,7 +172,7 @@ export class MockDroplApi {
     let body: any = null;
     if (raw.length > 0) body = JSON.parse(raw.toString("utf8"));
     const path = url.pathname.replace(/^\/api/, "");
-    this.requests.push({ method, path, headers: request.headers, body });
+    this.requests.push({ method, path, headers: request.headers, body, query: url.searchParams });
 
     const send = (status: number, payload: unknown, headers: Record<string, string> = {}) => {
       response.writeHead(status, { "content-type": "application/json", ...headers });
@@ -434,6 +444,69 @@ export class MockDroplApi {
         updatedAt: null,
       }];
     }
-    return notFound;
+    return this.routeCollections(method, path, body) ?? notFound;
+  }
+
+  private routeCollections(method: string, path: string, body: any): [number, unknown] | null {
+    const limits = { itemsUsed: this.collectionItems.length, itemLimit: 1000 };
+    if (method === "GET" && path === "/v1/sites/site1/collections") {
+      return [200, {
+        collections: [{ id: MOCK_COLLECTION_ID, name: "Menu", slug: "menu", visibility: "public", itemCount: this.collectionItems.length, publishedItemCount: 0, deletedAt: null, lastPublicReadAt: null }],
+        limits,
+        canEditSchema: true,
+      }];
+    }
+    if (method === "POST" && path === "/v1/sites/site1/collections/plan") {
+      const destructive = body.collections.some((entry: any) => entry.fields && !entry.fields.some((field: any) => field.key === "price"));
+      if (!body.dryRun && destructive && !body.confirmDestructive) {
+        return [409, { error: { code: "CONFIRMATION_REQUIRED", message: "This change removes data." } }];
+      }
+      return [200, {
+        applied: !body.dryRun,
+        destructive,
+        summary: destructive ? `Menu: remove field "Price" (3 items lose their value).` : "Menu: no changes.",
+        results: [{ slug: "menu", name: "Menu", action: destructive ? "update" : "unchanged", collectionId: MOCK_COLLECTION_ID, changes: [], destructive, schemaVersion: 3, message: null }],
+      }];
+    }
+    const collectionMatch = /^\/v1\/collections\/([^/]+)(\/.*)?$/.exec(path);
+    if (!collectionMatch || collectionMatch[1] !== MOCK_COLLECTION_ID) return null;
+    const rest = collectionMatch[2] ?? "";
+    if (method === "GET" && rest === "/schema") {
+      return [200, {
+        collectionId: MOCK_COLLECTION_ID,
+        slug: "menu",
+        name: "Menu",
+        schemaVersion: 3,
+        titleFieldKey: "name",
+        fields: MOCK_COLLECTION_FIELDS,
+        timezone: "America/Chicago",
+        typescript: "export interface MenuItem {}",
+        publicItemsUrl: `${this.origin}/api/v1/public/collections/pubcol1/items`,
+      }];
+    }
+    if (method === "POST" && rest === "/items/bulk") {
+      const errors = body.items.flatMap((item: any, index: number) => (typeof item.values.name === "string" && item.values.name ? [] : [{ index, errors: { name: "Name is required." } }]));
+      const valid = body.items.filter((_item: any, index: number) => !errors.some((error: any) => error.index === index));
+      const save = !body.dryRun && !(body.mode === "all_or_nothing" && errors.length > 0);
+      const created = save ? valid.map((item: any) => ({ id: nextId("it"), values: item.values, status: item.status ?? "published" })) : [];
+      if (save) this.collectionItems.push(...created);
+      return [200, { created, errors, dryRun: Boolean(body.dryRun) }];
+    }
+    if (method === "GET" && rest === "/items") {
+      const items = this.collectionItems.map((item: any, position) => ({ ...item, slug: `item-${position}`, title: String(item.values.name), position, updatedAt: "2026-10-01T00:00:00.000Z", deletedAt: null }));
+      return [200, { items, total: items.length, limit: 50, offset: 0, media: {} }];
+    }
+    const activity = [
+      { id: "act2", action: "item.created", summary: "Added an item", actor: { type: "user", name: "Ada" }, createdAt: "2026-10-02T00:00:00.000Z", undoable: false, undoneAt: null },
+      { id: "act1", action: "schema.changed", summary: `Renamed "Cost" to "Price"`, actor: { type: "user", name: "Ada" }, createdAt: "2026-10-01T00:00:00.000Z", undoable: this.collectionActivityUndoable, undoneAt: null },
+    ];
+    if (method === "GET" && rest === "/activity") return [200, { activity }];
+    const undoMatch = /^\/activity\/([^/]+)\/undo$/.exec(rest);
+    if (method === "POST" && undoMatch) {
+      if (undoMatch[1] !== "act1" || !this.collectionActivityUndoable) return [409, { error: { code: "UNDO_NOT_AVAILABLE", message: "This change can't be undone." } }];
+      this.collectionActivityUndoable = false;
+      return [200, { changes: [{ kind: "field_renamed", fieldKey: "price", description: `Rename "Price" to "Cost"`, destructive: false, affectedItemCount: 0 }], destructive: false, applied: true, collection: { schemaVersion: 4 } }];
+    }
+    return null;
   }
 }

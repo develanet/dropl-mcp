@@ -4,6 +4,9 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { CallToolResult, ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
+  COLLECTION_EDIT_RULES,
+  COLLECTION_TOOL_DESCRIPTIONS,
+  CollectionToolError,
   GALLERY_CATEGORY_NAME_MAX_LENGTH,
   GALLERY_CATEGORY_SLUG_MAX_LENGTH,
   GALLERY_CATEGORY_SLUG_PATTERN,
@@ -16,7 +19,14 @@ import {
   SITE_DOMAIN_PATTERN,
   VIDEO_LIST_MAX_LIMIT,
   WORKSPACE_NAME_MAX_LENGTH,
+  COLLECTION_ITEMS_PAGE_MAX,
   type AddGalleryVideosRequest,
+  type CollectionActivityResponse,
+  type CollectionItemListResponse,
+  type CollectionListResponse,
+  type CollectionPlanResponse,
+  type CollectionSchemaChangeResponse,
+  type CollectionSchemaResponse,
   type CreateGalleryCategoryRequest,
   type GalleryCategorySummary,
   type GalleryDetail,
@@ -34,6 +44,21 @@ import {
 } from "@dropl/shared";
 import { DroplApiClient, pathSegment } from "./api-client.js";
 import { bulkTagItems, ensureCategories, findCategory, normalizeCategoryName, showcasePath } from "./categories.js";
+import {
+  addCollectionItems,
+  collectionCodeResult,
+  collectionItemFiltersSchema,
+  collectionItemInputSchema,
+  collectionListResult,
+  collectionPath,
+  collectionPlanSchema,
+  itemFilterQuery,
+  itemListResult,
+  MAX_COLLECTION_ITEMS_PER_CALL,
+  pickUndoableActivity,
+  planResult,
+  sitePath,
+} from "./collections.js";
 import { chunk } from "./concurrency.js";
 import { ConfigError, configDirectory, currentPlatformContext, LOGIN_COMMAND, resolveApiUrl, type PlatformContext } from "./config.js";
 import { CredentialsError, credentialsPath, resolveCredentials, type ResolvedCredentials } from "./credentials.js";
@@ -71,7 +96,14 @@ Rules:
 - Pass absolute paths (or set cwd to the project folder) for uploads.
 - Uploads are resumable and idempotent: if one stops partway, run the same call again; finished files are skipped.
 - Use get_embed_code for embed snippets; never write embed HTML by hand.
-- After adding an embed to the user's project, run the project's build (or type check) to make sure it still compiles.`;
+- After adding an embed to the user's project, run the project's build (or type check) to make sure it still compiles.
+
+Collections (structured content like menus, inventory, and events that clients edit in the dashboard):
+- ${COLLECTION_EDIT_RULES.readFirst}
+- Run plan_collections first (it never saves), show the summary to the user, and only call apply_collection_plan after their explicit confirmation. Pass confirmDestructive: true only after they agree to every change marked destructive.
+- ${COLLECTION_EDIT_RULES.keepKeys}
+- Import items with add_collection_items and dryRun: true first; fix or report per-item errors before saving.
+- ${COLLECTION_EDIT_RULES.useCode}`;
 
 const CONFIRM_FIRST = "Only call after showing the plan to the user and getting explicit confirmation.";
 
@@ -246,7 +278,7 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     try {
       return textResult(await action());
     } catch (error) {
-      const expected = error instanceof UserFacingError || error instanceof CredentialsError || error instanceof ConfigError;
+      const expected = error instanceof UserFacingError || error instanceof CollectionToolError || error instanceof CredentialsError || error instanceof ConfigError;
       if (!expected) dependencies.log(`[dropl-mcp] ${toolName} failed: ${describeError(error)}`);
       return errorResult(error);
     }
@@ -645,6 +677,159 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
           // The plan works offline; storage just isn't included.
         }
         return planMigration(input, usage);
+      }),
+  );
+
+  server.registerTool(
+    "list_collections",
+    {
+      title: "List collections",
+      description: COLLECTION_TOOL_DESCRIPTIONS.list_collections,
+      inputSchema: {
+        siteId: idSchema("Client site id (from list_sites)."),
+        trashed: z.boolean().optional().describe("List trashed collections instead (restorable for 30 days)."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    ({ siteId, trashed }) =>
+      run("list_collections", async () => {
+        const { client } = await connect();
+        return collectionListResult(await client.get<CollectionListResponse>(`${sitePath(siteId)}/collections`, { query: { trashed: trashed ? "true" : undefined } }));
+      }),
+  );
+
+  server.registerTool(
+    "get_collection_schema",
+    {
+      title: "Get collection schema",
+      description: COLLECTION_TOOL_DESCRIPTIONS.get_collection_schema,
+      inputSchema: { collectionId: idSchema("Collection id (from list_collections).") },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    ({ collectionId }) =>
+      run("get_collection_schema", async () => {
+        const { client } = await connect();
+        const { typescript: _typescript, ...schema } = await client.get<CollectionSchemaResponse>(`${collectionPath(collectionId)}/schema`);
+        return schema;
+      }),
+  );
+
+  server.registerTool(
+    "plan_collections",
+    {
+      title: "Plan collections",
+      description: `${COLLECTION_TOOL_DESCRIPTIONS.plan_collections} Show the summary to the user before apply_collection_plan.`,
+      inputSchema: {
+        siteId: idSchema("Client site id (from list_sites)."),
+        collections: collectionPlanSchema,
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    ({ siteId, collections }) =>
+      run("plan_collections", async () => {
+        const { client } = await connect();
+        const body = { collections, dryRun: true };
+        return planResult(await client.post<CollectionPlanResponse>(`${sitePath(siteId)}/collections/plan`, body), true);
+      }),
+  );
+
+  server.registerTool(
+    "apply_collection_plan",
+    {
+      title: "Apply collection plan",
+      description: `${COLLECTION_TOOL_DESCRIPTIONS.apply_collection_plan} ${CONFIRM_FIRST}`,
+      inputSchema: {
+        siteId: idSchema("Client site id (from list_sites)."),
+        collections: collectionPlanSchema,
+        confirmDestructive: z.boolean().optional().describe("Only after the user explicitly agreed to every destructive change in the plan."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    ({ siteId, collections, confirmDestructive }) =>
+      run("apply_collection_plan", async () => {
+        const { client } = await connect();
+        const body = { collections, dryRun: false, confirmDestructive: confirmDestructive === true };
+        return planResult(await client.post<CollectionPlanResponse>(`${sitePath(siteId)}/collections/plan`, body), false);
+      }),
+  );
+
+  server.registerTool(
+    "add_collection_items",
+    {
+      title: "Add collection items",
+      description: `${COLLECTION_TOOL_DESCRIPTIONS.add_collection_items} Run with dryRun: true (the default) first; saving (dryRun: false) needs explicit confirmation. Accepts up to ${MAX_COLLECTION_ITEMS_PER_CALL} items, sent in batches; retrying the same call doesn't duplicate items.`,
+      inputSchema: {
+        collectionId: idSchema("Collection id (from list_collections)."),
+        items: z.array(collectionItemInputSchema).min(1).max(MAX_COLLECTION_ITEMS_PER_CALL),
+        dryRun: z.boolean().optional().describe("Validate only (default true)."),
+        mode: z.enum(["valid_only", "all_or_nothing"]).optional().describe("valid_only (default) saves the valid items; all_or_nothing saves nothing if any item is invalid."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    ({ collectionId, items, dryRun, mode }) =>
+      run("add_collection_items", async () => {
+        const { client } = await connect();
+        return addCollectionItems(client, { collectionId, items, dryRun: dryRun ?? true, mode: mode ?? "valid_only" });
+      }),
+  );
+
+  server.registerTool(
+    "list_collection_items",
+    {
+      title: "List collection items",
+      description: COLLECTION_TOOL_DESCRIPTIONS.list_collection_items,
+      inputSchema: {
+        collectionId: idSchema("Collection id (from list_collections)."),
+        q: z.string().max(200).optional().describe("Search titles and text fields."),
+        status: z.enum(["draft", "published"]).optional(),
+        filters: collectionItemFiltersSchema.optional(),
+        sort: z.string().max(60).optional().describe("position (default), createdAt, updatedAt, publishedAt, title, or a field key; prefix - for descending."),
+        trashed: z.boolean().optional(),
+        limit: z.number().int().min(1).max(COLLECTION_ITEMS_PAGE_MAX).optional(),
+        offset: z.number().int().min(0).optional(),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    ({ collectionId, q, status, filters, sort, trashed, limit, offset }) =>
+      run("list_collection_items", async () => {
+        const { client } = await connect();
+        const query = { q, status, sort, limit, offset, trashed: trashed ? "true" : undefined, ...itemFilterQuery(filters ?? []) };
+        return itemListResult(await client.get<CollectionItemListResponse>(`${collectionPath(collectionId)}/items`, { query }));
+      }),
+  );
+
+  server.registerTool(
+    "get_collection_code",
+    {
+      title: "Get collection code",
+      description: COLLECTION_TOOL_DESCRIPTIONS.get_collection_code,
+      inputSchema: { collectionId: idSchema("Collection id (from list_collections).") },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    ({ collectionId }) =>
+      run("get_collection_code", async () => {
+        const { client } = await connect();
+        return collectionCodeResult(await client.get<CollectionSchemaResponse>(`${collectionPath(collectionId)}/schema`));
+      }),
+  );
+
+  server.registerTool(
+    "undo_collection_change",
+    {
+      title: "Undo collection change",
+      description: `${COLLECTION_TOOL_DESCRIPTIONS.undo_collection_change} ${CONFIRM_FIRST}`,
+      inputSchema: {
+        collectionId: idSchema("Collection id (from list_collections)."),
+        activityId: idSchema("Activity entry to undo; defaults to the most recent undoable one.").optional(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    ({ collectionId, activityId }) =>
+      run("undo_collection_change", async () => {
+        const { client } = await connect();
+        const entry = pickUndoableActivity(await client.get<CollectionActivityResponse>(`${collectionPath(collectionId)}/activity`), activityId);
+        const result = await client.post<CollectionSchemaChangeResponse>(`${collectionPath(collectionId)}/activity/${pathSegment(entry.id)}/undo`, {});
+        return { undone: entry.summary, changes: result.changes, schemaVersion: result.collection.schemaVersion };
       }),
   );
 
