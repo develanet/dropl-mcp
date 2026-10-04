@@ -1,0 +1,195 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/dist/mcpb-manifest-v0.3.schema.json",
+  "manifest_version": "0.3",
+  "name": "dropl",
+  "display_name": "Dropl",
+  "version": "0.6.0",
+  "description": "Create client-editable photo and video galleries from Cursor or Claude Code, then embed them.",
+  "long_description": "Dropl MCP lets AI coding agents set up Dropl for client websites: create client sites and showcases (embeddable photo and video galleries), upload whole folders of media with categories, fetch embed code for HTML, Next.js, WordPress, Webflow, and Framer, manage collections like menus, inventory, and events, and work through client feedback by fixing it in code, replying, and marking it done. Clients then update their own photos and videos from a phone, without a CMS.",
+  "author": {
+    "name": "Dropl",
+    "url": "https://www.dropl.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/develanet/dropl-mcp"
+  },
+  "homepage": "https://www.dropl.io/mcp",
+  "documentation": "https://www.dropl.io/mcp",
+  "support": "https://github.com/develanet/dropl-mcp/issues",
+  "icon": "icon.png",
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/server/index.js"
+      ],
+      "env": {
+        "DROPL_API_KEY": "${user_config.api_key}"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "whoami",
+      "description": "Shows the connected Dropl account, user, role, and API key (name, prefix, scopes, site restriction) plus the web app URL."
+    },
+    {
+      "name": "list_sites",
+      "description": "Lists the client sites (one per client website) this connection can reach, with their domains and the plan's site allowance."
+    },
+    {
+      "name": "create_site",
+      "description": "Creates a client site: the home for one client website's showcases, videos, collections, and feedback."
+    },
+    {
+      "name": "list_showcases",
+      "description": "Lists a client site's showcases (embeddable photo and video galleries), newest first, with item counts."
+    },
+    {
+      "name": "create_showcase",
+      "description": "Creates a showcase: an embeddable photo/video gallery the client can update from their phone."
+    },
+    {
+      "name": "get_showcase",
+      "description": "Summarizes a showcase: settings, item counts by status and kind, categories with counts, photos without alt text, and failed items."
+    },
+    {
+      "name": "list_showcase_items",
+      "description": "Pages through a showcase's items in display order: id, kind, status, file name, local upload path, alt text, and categories."
+    },
+    {
+      "name": "update_items",
+      "description": "Sets alt text and adds/removes categories on many showcase items in one call."
+    },
+    {
+      "name": "update_showcase",
+      "description": "Changes a showcase's title, layout, grid fit, category filter tabs, or items per page."
+    },
+    {
+      "name": "create_category",
+      "description": "Adds a category (a filter tab) to a showcase."
+    },
+    {
+      "name": "tag_items",
+      "description": "Adds and/or removes the same categories on many showcase items (photos or videos) at once."
+    },
+    {
+      "name": "upload_photos",
+      "description": "Uploads local photos (JPEG, PNG, WebP, AVIF, HEIC; up to 20 MB each) into a showcase, straight to storage."
+    },
+    {
+      "name": "list_videos",
+      "description": "Lists videos in a client site's library (newest first), optionally filtered by a title search."
+    },
+    {
+      "name": "upload_videos",
+      "description": "Uploads local videos to a client site's video library in resumable parts, for streaming playback without YouTube or Vimeo."
+    },
+    {
+      "name": "add_videos_to_showcase",
+      "description": "Adds existing library videos to a showcase."
+    },
+    {
+      "name": "get_embed_code",
+      "description": "Returns the official embed snippet for a video or a showcase, plus where and how to paste it (HTML, React/Next.js, WordPress, Webflow, Framer)."
+    },
+    {
+      "name": "get_usage",
+      "description": "Shows storage and bandwidth used against the plan's limits this period, and whether uploads or playback are suspended."
+    },
+    {
+      "name": "plan_migration",
+      "description": "Scans a local folder without uploading and proposes how to bring it into Dropl: categories, counts and sizes, unsupported files, and upload batches."
+    },
+    {
+      "name": "list_collections",
+      "description": "Lists a client site's collections (menus, inventory, events, …) with item counts, last website read, and the plan's limits."
+    },
+    {
+      "name": "get_collection_schema",
+      "description": "Reads a collection's current fields, schemaVersion, and site time zone, including edits made in the dashboard."
+    },
+    {
+      "name": "plan_collections",
+      "description": "Dry run: previews creating or changing up to 10 collections on a client site and returns a plain-text diff."
+    },
+    {
+      "name": "apply_collection_plan",
+      "description": "Creates or changes the collections previewed with plan_collections."
+    },
+    {
+      "name": "add_collection_items",
+      "description": "Bulk-adds items to a collection with per-item errors keyed by field key."
+    },
+    {
+      "name": "list_collection_items",
+      "description": "Lists a collection's items, drafts included, with search, status and field filters, sorting, and paging."
+    },
+    {
+      "name": "get_collection_code",
+      "description": "Returns TypeScript types and a Next.js fetch example generated from the collection's current fields, plus its public items URL."
+    },
+    {
+      "name": "undo_collection_change",
+      "description": "Undoes the most recent schema change of a collection when no data written since would be lost."
+    },
+    {
+      "name": "list_feedback",
+      "description": "Lists feedback the client left on their website (comments on elements, text changes, general notes), newest first."
+    },
+    {
+      "name": "get_feedback",
+      "description": "Gets one feedback request with its full context: page URL, clicked element, device and viewport, screenshots, and the thread."
+    },
+    {
+      "name": "reply_to_feedback",
+      "description": "Replies in a feedback request's thread as the signed-in user; the client gets the reply by email."
+    },
+    {
+      "name": "update_feedback_status",
+      "description": "Sets a feedback request to open, in_progress, done, or wont_do."
+    }
+  ],
+  "tools_generated": false,
+  "prompts_generated": false,
+  "keywords": [
+    "mcp",
+    "photo-gallery",
+    "video-hosting",
+    "gallery-embed",
+    "client-portal",
+    "headless-cms",
+    "nextjs",
+    "webflow",
+    "framer",
+    "wordpress",
+    "dropl"
+  ],
+  "license": "MIT",
+  "privacy_policies": [
+    "https://www.dropl.io/privacy"
+  ],
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
+    "runtimes": {
+      "node": ">=20.3"
+    }
+  },
+  "user_config": {
+    "api_key": {
+      "type": "string",
+      "title": "Dropl API key",
+      "description": "Optional. Dropl API key; overrides the saved browser sign-in. Leave blank to use the sign-in saved by `npx -y @dropl/mcp login`.",
+      "sensitive": true,
+      "required": false,
+      "default": ""
+    }
+  }
+}

@@ -1,0 +1,2 @@
+# MCPB bundle staging and output (pnpm bundle); also ignored in the public mirror, which has no root .gitignore
+build/

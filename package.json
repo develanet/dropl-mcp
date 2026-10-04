@@ -53,8 +53,9 @@
     "test": "vitest run",
     "sync-version": "node scripts/sync-version.mjs",
     "check:tools": "node scripts/check-tools.mjs",
+    "bundle": "node scripts/bundle-mcpb.mjs && mcpb pack build/mcpb build/dropl.mcpb",
     "prepublishOnly": "node scripts/sync-version.mjs && npm run build && node scripts/check-tools.mjs",
-    "clean": "rm -rf dist .turbo"
+    "clean": "rm -rf dist build .turbo"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",
@@ -62,6 +63,7 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@anthropic-ai/mcpb": "^2.1.2",
     "@dropl/shared": "workspace:*",
     "@dropl/typescript-config": "workspace:*",
     "@types/node": "^24.19.0",
