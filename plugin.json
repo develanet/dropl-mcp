@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dropl",
+  "version": "0.6.0",
+  "description": "Create client-editable photo and video galleries from Cursor or Claude Code, then embed them.",
+  "author": {
+    "name": "Dropl",
+    "url": "https://www.dropl.io"
+  },
+  "homepage": "https://www.dropl.io/mcp",
+  "repository": "https://github.com/develanet/dropl-mcp",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "dropl",
+    "photo-gallery",
+    "video-hosting",
+    "gallery-embed",
+    "client-portal",
+    "client-feedback",
+    "headless-cms",
+    "media-migration"
+  ]
+}
