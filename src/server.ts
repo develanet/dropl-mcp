@@ -27,6 +27,14 @@ import {
   FEEDBACK_REQUEST_TYPES,
   FEEDBACK_RESOLUTION_NOTE_MAX_LENGTH,
   FEEDBACK_STATUSES,
+  PROJECT_DESCRIPTION_MAX_LENGTH,
+  PROJECT_SLUG_MAX_LENGTH,
+  PROJECT_SLUG_PATTERN,
+  PROJECT_SUBTITLE_MAX_LENGTH,
+  PROJECT_TITLE_MAX_LENGTH,
+  PROJECT_URL_TEMPLATE_MAX_LENGTH,
+  SHOWCASE_TYPE_CODES,
+  isProjectUrlTemplate,
   type AddGalleryVideosRequest,
   type CollectionActivityResponse,
   type CollectionItemListResponse,
@@ -40,6 +48,8 @@ import {
   type GalleryCategorySummary,
   type GalleryDetail,
   type GalleryListResponse,
+  type GalleryProjectListResponse,
+  type ProjectDetailsSchemaResponse,
   type PublicApiCreateShowcaseRequest,
   type PublicApiCreateSiteRequest,
   type PublicApiMeResponse,
@@ -79,6 +89,23 @@ import { formatBytes, truncateList } from "./format.js";
 import { deriveIdempotencyKey } from "./idempotency.js";
 import { planMigration } from "./migration-plan.js";
 import { uploadPhotos } from "./photo-upload.js";
+import {
+  LIST_PROJECTS_DEFAULT_LIMIT,
+  PROJECT_DETAIL_EDIT_RULES,
+  changeProjectDetails,
+  createProject,
+  findProject,
+  listProjectsResult,
+  projectDetailFieldsSchema,
+  projectDetailValuesSchema,
+  projectDetailsPath,
+  projectDetailsResult,
+  reorderProjectItems,
+  reorderProjects,
+  requireProjectsShowcase,
+  showcaseType,
+  updateProject,
+} from "./projects.js";
 import { sleep as defaultSleep, type Random, type Sleep } from "./retry.js";
 import { putToStorage, type StoragePut } from "./storage-put.js";
 import type { MediaUploadContext, ProgressReporter } from "./upload-common.js";
@@ -105,13 +132,16 @@ const MAX_CATEGORIES_PER_CALL = 50;
 const MAX_ITEM_UPDATES_PER_CALL = 1000;
 const LIST_SEARCH_MAX_LENGTH = 200;
 const PERCENT = 100;
+/** Projects are referenced by id, slug, or title. */
+const PROJECT_REFERENCE_MAX_LENGTH = Math.max(ID_MAX_LENGTH, PROJECT_TITLE_MAX_LENGTH);
+const MAX_PROJECTS_PER_REORDER = 100;
 /** plan_migration works offline, so its optional storage lookup must not hold it up. */
 const USAGE_PROBE_TIMEOUT_MS = 5_000;
 
 export const SERVER_INSTRUCTIONS = `Dropl hosts client-editable photo and video galleries (showcases), videos, and collections that web studios embed on their clients' websites; clients then update them from the Dropl dashboard or their phone, without a CMS. These tools set that up from the user's codebase: create client sites and showcases, upload local photos and videos, fetch embed code, manage collections, and work through client feedback. Typical flow: whoami, then list_sites (or create_site), create_showcase, upload_photos, and get_embed_code, then paste the embed and build. Before creating or uploading anything, show the user the plan and wait for their explicit confirmation.
 
 Rules:
-- Before creating a site or showcase or uploading anything, run plan_migration (or upload_photos / upload_videos with dryRun: true), show the plan to the user (client site, showcase title, categories, file counts and sizes) and get their explicit confirmation. Don't create or upload on your own initiative.
+- Before creating a site or showcase or uploading anything, run plan_migration (or upload_photos / upload_videos with dryRun: true), show the plan to the user (client site, showcase title, categories or projects, file counts and sizes) and get their explicit confirmation. Don't create or upload on your own initiative.
 - Prefer existing client sites and showcases (list_sites, list_showcases) over creating duplicates.
 - Never ask the user to paste an API key into the chat. If a tool says you're not signed in, ask the user to run \`${LOGIN_COMMAND}\` in their own terminal (or set DROPL_API_KEY in this server's MCP config), then try again.
 - Pass absolute paths (or set cwd to the project folder) for uploads.
@@ -120,6 +150,13 @@ Rules:
 - Alt text: ${ALT_TEXT_GUIDANCE} Set it per photo with upload_photos files[].alt, or later with update_items.
 - Use get_embed_code for embed snippets; never write embed HTML by hand.
 - After adding an embed to the user's project, run the project's build (or type check) to make sure it still compiles.
+
+Projects showcases (portfolios: an index of projects, each with its own page, photos and videos, description, and details):
+- Use create_showcase with type: "projects" when each job or folder is its own project. plan_migration plans one project per folder (with layout: "projects", or on its own for a projects/ folder of project folders).
+- Add each project with create_project (title, subtitle like "Custom Home · Zebulon, NC", description, details, categories), then upload into it with upload_photos / upload_videos and project (its slug, title, or id). In a projects showcase every photo and video belongs to a project, and categories belong to projects.
+- list_projects pages through the projects, or one project's items; update_project, reorder_projects, and reorder_project_items change them.
+- Details (facts every project fills in, like location or square footage) are defined once per showcase. ${PROJECT_DETAIL_EDIT_RULES.readFirst} ${PROJECT_DETAIL_EDIT_RULES.keepKeys} ${PROJECT_DETAIL_EDIT_RULES.confirm}
+- get_embed_code with projectUrl (e.g. "/work/{slug}") links the index cards to the website's own project pages; with project it returns that project's page snippet.
 
 Collections (structured content like menus, inventory, and events that clients edit in the dashboard):
 - ${COLLECTION_EDIT_RULES.readFirst}
@@ -139,6 +176,13 @@ Tell the user which requests you fixed, which you asked about, and which you ski
 const COLLECTIONS_PLAN_DESCRIPTION =
   "Collections to create or change, e.g. [{ \"name\": \"Menu\", \"fields\": [{ \"label\": \"Name\", \"type\": \"text\" }, { \"label\": \"Price\", \"type\": \"price\", \"currency\": \"USD\" }] }].";
 const CONFIRM_FIRST = "Only call after showing the plan to the user and getting explicit confirmation.";
+const PROJECT_DETAILS_FIELDS_DESCRIPTION =
+  "Every detail, in order: existing ones with their key (and option values) as read, new ones without, e.g. [{ \"key\": \"location\", \"label\": \"Location\", \"type\": \"short_text\" }, { \"label\": \"Square footage\", \"type\": \"number\", \"unit\": \"sq ft\", \"showOnCard\": true }].";
+const projectDetailsVersionSchema = z
+  .number()
+  .int()
+  .min(0)
+  .describe("The version you read with get_project_details, e.g. 3.");
 
 export interface ServerDependencies {
   platform: PlatformContext;
@@ -198,6 +242,35 @@ const categoryNamesSchema = z
 const layoutSchema = z.enum(["grid", "collage"]).optional().describe("grid (even tiles) or collage (masonry), e.g. \"grid\".");
 const gridFitSchema = z.enum(["cover", "contain"]).optional().describe("cover crops grid tiles; contain letterboxes them to show the whole item, e.g. \"cover\".");
 const showCategoryFiltersSchema = z.boolean().optional().describe("Show category filter tabs above the items, e.g. true when items are grouped into categories.");
+const projectReferenceSchema = (description: string) =>
+  z.string().trim().min(1).max(PROJECT_REFERENCE_MAX_LENGTH).describe(withExample(description, "\"arched-entry-two-story\""));
+const projectTitleSchema = z.string().trim().min(1).max(PROJECT_TITLE_MAX_LENGTH);
+const projectSubtitleSchema = z
+  .string()
+  .trim()
+  .max(PROJECT_SUBTITLE_MAX_LENGTH)
+  .nullable()
+  .optional()
+  .describe("The line under the title, often type and location, e.g. \"Custom Home · Zebulon, NC\"; null clears it.");
+const projectDescriptionSchema = z
+  .string()
+  .trim()
+  .max(PROJECT_DESCRIPTION_MAX_LENGTH)
+  .nullable()
+  .optional()
+  .describe("Plain text shown on the project page (cards show its start), e.g. \"A two-story custom home with an arched entry.\"; null clears it.");
+const projectSlugSchema = z
+  .string()
+  .regex(PROJECT_SLUG_PATTERN)
+  .max(PROJECT_SLUG_MAX_LENGTH)
+  .optional()
+  .describe("URL form used in project page links, e.g. \"arched-entry-two-story\"; derived from the title when omitted.");
+const projectDetailValuesInputSchema = projectDetailValuesSchema
+  .optional()
+  .describe("Detail values by key (see get_project_details): numbers as numbers (the unit is separate), select as an option value, dates as YYYY-MM-DD, links as URLs; null clears one, e.g. { \"square_footage\": 3200, \"year\": 2024 }.");
+const projectCategoriesSchema = categoryNamesSchema
+  .optional()
+  .describe("Category names, slugs, or ids (the showcase's filter tabs); missing names are created, e.g. [\"Custom Homes\"].");
 const pageSizeSchema = z
   .number()
   .int()
@@ -237,17 +310,35 @@ export function summarizeShowcase(detail: GalleryDetail) {
     detail.images.filter((item) => item.status === "failed").map((item) => ({ id: item.id, fileName: item.sourceFileName, reason: item.failureReason })),
     MAX_LISTED_FAILED_ITEMS,
   );
+  const type = showcaseType(detail);
+  const projects = detail.projects ?? [];
   return {
     id: detail.id,
     publicId: detail.publicId,
     title: detail.title,
+    type,
     settings: { layout: detail.layout, gridFit: detail.gridFit, showCategoryFilters: detail.showCategoryFilters, pageSize: detail.pageSize },
     itemCount: detail.images.length,
     photos: kindCounts.photo,
     videos: kindCounts.video,
     byStatus: statusCounts,
     videoAvailability,
-    categories: detail.categories.map((category) => ({ id: category.id, name: category.name, slug: category.slug, itemCount: category.itemCount })),
+    ...(type === "projects" && {
+      projects: {
+        count: projects.length,
+        withoutReadyItems: projects.filter((project) => project.readyItemCount === 0).length,
+        details: (detail.projectDetailFields ?? []).map((field) => field.label),
+        detailsVersion: detail.projectDetailsVersion,
+        note: "Projects show on the website once they have a ready photo or video. Use list_projects for each project's slug, details, and items.",
+      },
+    }),
+    categories: detail.categories.map((category) => ({
+      id: category.id,
+      name: category.name,
+      slug: category.slug,
+      itemCount: category.itemCount,
+      ...(type === "projects" && { projectCount: category.projectCount }),
+    })),
     uncategorized,
     photosWithoutAltText: detail.images.filter((item) => item.kind === "photo" && !item.altText).length,
     failedItems: failedItems.items,
@@ -403,7 +494,7 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     {
       title: "List showcases",
       description:
-        "Lists a client site's showcases (embeddable photo and video galleries), newest first, with item counts. Use it to reuse an existing gallery instead of creating a duplicate, or to find a showcase id. Paged: pass nextCursor to get more.",
+        "Lists a client site's showcases (embeddable photo and video galleries), newest first, with their type (gallery or projects) and item and project counts. Use it to reuse an existing gallery or portfolio instead of creating a duplicate, or to find a showcase id. Paged: pass nextCursor to get more.",
       inputSchema: {
         siteId: idSchema("Client site id from list_sites."),
         cursor: z.string().max(ID_MAX_LENGTH).optional().describe("nextCursor from a previous call, e.g. \"eyJpZCI6IjAxOTAifQ\"."),
@@ -420,9 +511,11 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
             id: gallery.id,
             publicId: gallery.publicId,
             title: gallery.title,
+            type: showcaseType(gallery),
             layout: gallery.layout,
             itemCount: gallery.itemCount,
             videoCount: gallery.videoCount,
+            ...(showcaseType(gallery) === "projects" && { projectCount: gallery.projectCount }),
             ...(gallery.isPrivate === true ? { private: true, note: "Private client photos from feedback: never public and can't be embedded." } : {}),
             updatedAt: gallery.updatedAt,
           })),
@@ -435,10 +528,14 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "create_showcase",
     {
       title: "Create showcase",
-      description: `Creates a showcase: an embeddable photo/video gallery the client can update from their phone. Use it when the user wants a gallery, portfolio, project photos, or a section the client can update themselves. Requires a site id from list_sites or create_site. ${CONFIRM_FIRST} Turn on showCategoryFilters when items will be grouped into categories. Safe to retry with the same arguments.`,
+      description: `Creates a showcase: an embeddable photo/video gallery the client can update from their phone. Use it when the user wants a gallery, portfolio, project photos, or a section the client can update themselves. Requires a site id from list_sites or create_site. ${CONFIRM_FIRST} Use type: "projects" for a portfolio where each project gets its own page, photos, and details (then create_project for each); the type can't change once the showcase has items. Turn on showCategoryFilters when items or projects will be grouped into categories. Safe to retry with the same arguments.`,
       inputSchema: {
         siteId: idSchema("Client site id from list_sites or create_site."),
         title: z.string().trim().min(1).max(GALLERY_TITLE_MAX_LENGTH).describe("Gallery title, e.g. \"Our work\"."),
+        type: z
+          .enum(SHOWCASE_TYPE_CODES)
+          .optional()
+          .describe("gallery (default: one set of photos and videos) or projects (a portfolio of projects, each with its own page, photos, description, and details), e.g. \"projects\"."),
         layout: layoutSchema,
         gridFit: gridFitSchema,
         showCategoryFilters: showCategoryFiltersSchema,
@@ -463,7 +560,7 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     {
       title: "Get showcase",
       description:
-        "Summarizes a showcase: settings, item counts by status (processing/ready/failed) and kind, categories with counts, photos without alt text, and failed items. Use it to check that an upload finished processing or to review a gallery before changing it. It returns counts, not items: use list_showcase_items for ids, alt text, and categories.",
+        "Summarizes a showcase: type, settings, item counts by status (processing/ready/failed) and kind, project counts and details (projects showcases), categories with counts, photos without alt text, and failed items. Use it to check that an upload finished processing or to review a gallery before changing it. It returns counts, not items: use list_showcase_items for ids, alt text, and categories, or list_projects for projects.",
       inputSchema: { showcaseId: idSchema("Showcase id from list_showcases or create_showcase.") },
       annotations: { title: "Get showcase", readOnlyHint: true, openWorldHint: false },
     },
@@ -643,9 +740,10 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "upload_photos",
     {
       title: "Upload photos",
-      description: `Uploads local photos (JPEG, PNG, WebP, AVIF, HEIC; up to 20 MB each) into a showcase, straight to storage. Use it to turn a folder of project photos into a client-editable gallery: pass files, folders (recursive by default), and globs via paths, and per-photo alt text and categories via files. Skips hidden files and validates file contents. Run with dryRun: true first and show the result to the user; ${CONFIRM_FIRST} Resumable: re-running with the same arguments skips files already uploaded (and still applies changed alt text and categories). categoryFromFolder tags each photo with its top-level folder's name; categories tags every photo (both created if missing). Returns files: each local path with its showcase item id and status, for update_items and tag_items. Alt text: ${ALT_TEXT_GUIDANCE}`,
+      description: `Uploads local photos (JPEG, PNG, WebP, AVIF, HEIC; up to 20 MB each) into a showcase, straight to storage. Use it to turn a folder of project photos into a client-editable gallery: pass files, folders (recursive by default), and globs via paths, and per-photo alt text and categories via files. Skips hidden files and validates file contents. Run with dryRun: true first and show the result to the user; ${CONFIRM_FIRST} Resumable: re-running with the same arguments skips files already uploaded (and still applies changed alt text and categories). categoryFromFolder tags each photo with its top-level folder's name; categories tags every photo (both created if missing). In a projects showcase, pass project: the photos join the end of that project (categories belong to the project there, not to photos); the same file can go into several projects. Returns files: each local path with its showcase item id and status, for update_items and tag_items. Alt text: ${ALT_TEXT_GUIDANCE}`,
       inputSchema: {
         showcaseId: idSchema("Showcase id from create_showcase or list_showcases."),
+        project: projectReferenceSchema("Projects showcases only, and required there: the project (slug, title, or id from list_projects or create_project) the photos join").optional(),
         paths: pathsSchema
           .optional()
           .describe("Files, folders, or glob patterns, e.g. [\"/abs/photos/**/*.jpg\"]. Prefer absolute paths; relative ones resolve against cwd. Pass paths, files, or both."),
@@ -722,13 +820,14 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "upload_videos",
     {
       title: "Upload videos",
-      description: `Uploads local videos (MP4, MOV, WebM, MKV, AVI, MPEG, M4V) to a client site's video library in resumable parts, titled from their file names, for streaming playback without YouTube or Vimeo. Use it to host a hero video or a folder of clips; with showcaseId it also adds them to that showcase (and applies categories / categoryFromFolder). Run with dryRun: true first; ${CONFIRM_FIRST} Re-running with the same arguments resumes interrupted uploads and skips finished ones. Returns files: each local path with its library video id.`,
+      description: `Uploads local videos (MP4, MOV, WebM, MKV, AVI, MPEG, M4V) to a client site's video library in resumable parts, titled from their file names, for streaming playback without YouTube or Vimeo. Use it to host a hero video or a folder of clips; with showcaseId it also adds them to that showcase (and applies categories / categoryFromFolder), and for a projects showcase to the project you pass. Run with dryRun: true first; ${CONFIRM_FIRST} Re-running with the same arguments resumes interrupted uploads and skips finished ones. Returns files: each local path with its library video id.`,
       inputSchema: {
         siteId: idSchema("Client site id from list_sites."),
         paths: pathsSchema,
         cwd: cwdSchema,
         recursive: recursiveSchema,
         showcaseId: idSchema("Showcase (in the same site) to add the videos to.").optional(),
+        project: projectReferenceSchema("With a projects showcase, and required there: the project (slug, title, or id) the videos join").optional(),
         categoryFromFolder: z.boolean().optional().describe("With showcaseId: tag each video with its top-level folder name, e.g. true."),
         categories: categoryNamesSchema.optional().describe("With showcaseId: categories to tag every video with, e.g. [\"Tours\"]."),
         dryRun: dryRunSchema,
@@ -747,7 +846,7 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     {
       title: "Add videos to showcase",
       description:
-        "Adds existing library videos to a showcase. Use it for videos already hosted in Dropl (ids from list_videos or upload_videos) instead of uploading them again. Videos must belong to the showcase's client site; ones already in it are skipped.",
+        "Adds existing library videos to a showcase, or to one project of a projects showcase. Use it for videos already hosted in Dropl (ids from list_videos or upload_videos) instead of uploading them again. Videos must belong to the showcase's client site; ones already in it are skipped.",
       inputSchema: {
         showcaseId: idSchema("Showcase id from list_showcases."),
         videoIds: z
@@ -755,18 +854,31 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
           .min(1)
           .max(MAX_ITEM_IDS_PER_CALL)
           .describe(withExample("Library video ids from list_videos or upload_videos", `["${EXAMPLE_ID}"]`)),
+        project: projectReferenceSchema("Projects showcases only, and required there: the project (slug, title, or id) the videos join").optional(),
       },
       annotations: { title: "Add videos to showcase", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    ({ showcaseId, videoIds }) =>
+    ({ showcaseId, videoIds, project }) =>
       run("add_videos_to_showcase", async () => {
         const { client } = await connect();
+        let target: { id: string; slug: string; title: string } | null = null;
+        if (project) {
+          const detail = await client.get<GalleryDetail>(showcasePath(showcaseId));
+          requireProjectsShowcase(detail);
+          const found = findProject(detail.projects ?? [], project);
+          target = { id: found.id, slug: found.slug, title: found.title };
+        }
         const uniqueIds = [...new Set(videoIds)];
         for (const batch of chunk(uniqueIds, MAX_GALLERY_VIDEOS_PER_REQUEST)) {
-          const body: AddGalleryVideosRequest = { videoIds: batch };
+          const body: AddGalleryVideosRequest = { videoIds: batch, ...(target && { projectId: target.id }) };
           await client.post<unknown>(`${showcasePath(showcaseId)}/videos`, body);
         }
-        return { showcaseId, added: uniqueIds.length, nextStep: "Use tag_items to put them in categories, or get_embed_code for the snippet." };
+        return {
+          showcaseId,
+          project: target,
+          added: uniqueIds.length,
+          nextStep: target ? "Use reorder_project_items to place them in the project, or get_embed_code for the snippet." : "Use tag_items to put them in categories, or get_embed_code for the snippet.",
+        };
       }),
   );
 
@@ -775,7 +887,7 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     {
       title: "Get embed code",
       description:
-        "Returns the official embed snippet for a video (videoId) or a showcase (showcaseId, optionally one category by name or slug), plus where and how to paste it (plain HTML, React/Next.js, WordPress, Webflow, Framer). Use it whenever a gallery or video goes onto a page. Always use this instead of writing embed HTML by hand; pass exactly one of videoId or showcaseId.",
+        "Returns the official embed snippet for a video (videoId) or a showcase (showcaseId, optionally one category by name or slug, or one project's page), plus where and how to paste it (plain HTML, React/Next.js, WordPress, Webflow, Framer). Use it whenever a gallery, portfolio, or video goes onto a page. Always use this instead of writing embed HTML by hand; pass exactly one of videoId or showcaseId. Projects showcases: the main snippet is the projects index; projectUrl links its cards to the website's own project pages, and project returns the snippet for one of those pages.",
       inputSchema: {
         videoId: idSchema("Video id from list_videos or upload_videos.").optional(),
         showcaseId: idSchema("Showcase id from list_showcases.").optional(),
@@ -784,16 +896,27 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
           .max(GALLERY_CATEGORY_SLUG_MAX_LENGTH)
           .optional()
           .describe("With showcaseId: a category name or slug, to embed only that category without filter tabs, e.g. \"kitchens\"."),
+        project: projectReferenceSchema("Projects showcases: a project (slug, title, or id) whose page snippet to return, for its own page on the website").optional(),
+        projectUrl: z
+          .string()
+          .trim()
+          .max(PROJECT_URL_TEMPLATE_MAX_LENGTH)
+          .optional()
+          .describe("Projects showcases: the website's project page URL with {slug}, a site path or https URL; index cards then link there instead of opening in place, e.g. \"/work/{slug}\"."),
       },
       annotations: { title: "Get embed code", readOnlyHint: true, openWorldHint: false },
     },
-    ({ videoId, showcaseId, category }) =>
+    ({ videoId, showcaseId, category, project, projectUrl }) =>
       run("get_embed_code", async () => {
         if (Boolean(videoId) === Boolean(showcaseId)) throw new UserFacingError("Pass either videoId or showcaseId.");
-        if (videoId && category) throw new UserFacingError("category only applies to showcases.");
+        if (videoId && (category || project || projectUrl)) throw new UserFacingError("category, project, and projectUrl only apply to showcases.");
+        if (projectUrl !== undefined && !isProjectUrlTemplate(projectUrl)) {
+          throw new UserFacingError(`projectUrl must be a site path or https URL containing {slug}, without quotes or spaces, e.g. "/work/{slug}"; got "${projectUrl}".`);
+        }
         const { client } = await connect();
         if (videoId) return videoEmbedResult(await client.get<PublicApiVideoEmbedResponse>(`/v1/videos/${pathSegment(videoId)}/embed`));
-        return showcaseEmbedResult(await client.get<PublicApiShowcaseEmbedResponse>(`${showcasePath(showcaseId!)}/embed`), category);
+        const response = await client.get<PublicApiShowcaseEmbedResponse>(`${showcasePath(showcaseId!)}/embed`, { query: { projectUrl } });
+        return showcaseEmbedResult(response, { category, project, projectUrl });
       }),
   );
 
@@ -817,12 +940,16 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     {
       title: "Plan a media migration",
       description:
-        "Scans a local folder without uploading and proposes how to bring it into Dropl: top-level folders become categories, photo/video counts and sizes per folder, unsupported files by reason, upload batches, whether it needs several showcases, remaining storage, and the tool calls to run. Use it first for any folder-to-gallery move or site migration, then show the plan to the user for confirmation. Works offline; remaining storage is only included when signed in.",
+        "Scans a local folder without uploading and proposes how to bring it into Dropl: top-level folders become categories (or, for a portfolio, projects), photo/video counts and sizes per folder, unsupported files by reason, upload batches, whether it needs several showcases, remaining storage, and the tool calls to run. Use it first for any folder-to-gallery move or site migration, then show the plan to the user for confirmation. Projects layout (one folder per project, each becoming a project page with a title and slug from its folder name): pass layout: \"projects\" (each subfolder of path, or of its projects/ folder, is a project); it's also picked on its own when path holds a projects/ folder of project folders, unless you pass layout: \"gallery\". Works offline; remaining storage is only included when signed in.",
       inputSchema: {
         path: z.string().min(1).max(PATH_MAX_LENGTH).describe("Folder to scan; prefer an absolute path, e.g. \"/Users/ana/sites/acme/public/projects\"."),
         cwd: cwdSchema,
         recursive: recursiveSchema,
-        categoryFromFolder: z.boolean().optional().describe("Turn top-level folders into categories (default true), e.g. false for one flat gallery."),
+        categoryFromFolder: z.boolean().optional().describe("Gallery layout: turn top-level folders into categories (default true), e.g. false for one flat gallery."),
+        layout: z
+          .enum(["gallery", "projects"])
+          .optional()
+          .describe("gallery (one showcase, folders as categories) or projects (one project per folder); omitted, projects only for a projects/ folder of project folders, e.g. \"projects\"."),
       },
       annotations: { title: "Plan a media migration", readOnlyHint: true, openWorldHint: false },
     },
@@ -836,6 +963,189 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
           // The plan works offline; storage just isn't included.
         }
         return planMigration(input, usage);
+      }),
+  );
+
+  server.registerTool(
+    "list_projects",
+    {
+      title: "List projects",
+      description: `Lists a projects showcase's projects in order: slug, title, subtitle, a description excerpt, detail values by key, categories, and item counts. With project, it returns that project's full description, labeled details, and its photos and videos in order (ids, local paths, alt text). Use it to find a project's slug for upload_photos and update_project, or item ids for update_items, reorder_project_items, and covers. Paged: pass nextOffset as offset (${LIST_PROJECTS_DEFAULT_LIMIT} projects or ${LIST_ITEMS_DEFAULT_LIMIT} items per page by default).`,
+      inputSchema: {
+        showcaseId: idSchema("Projects showcase id from list_showcases."),
+        project: projectReferenceSchema("A project (slug, title, or id) to list with its items").optional(),
+        offset: z.number().int().min(0).optional().describe("nextOffset from a previous call, e.g. 20."),
+        limit: z.number().int().min(1).max(LIST_ITEMS_MAX_LIMIT).optional().describe(`Projects (or, with project, items) per page, up to ${LIST_ITEMS_MAX_LIMIT}, e.g. 50.`),
+      },
+      annotations: { title: "List projects", readOnlyHint: true, openWorldHint: false },
+    },
+    ({ showcaseId, ...options }) =>
+      run("list_projects", async () => {
+        const { client } = await connect();
+        const [detail, list] = await Promise.all([
+          client.get<GalleryDetail>(showcasePath(showcaseId)),
+          client.get<GalleryProjectListResponse>(`${showcasePath(showcaseId)}/projects`),
+        ]);
+        requireProjectsShowcase(detail);
+        const localPaths = options.project ? await localPathsByItemId(client, configDir, detail, dependencies.log) : new Map<string, string>();
+        return listProjectsResult(list, detail, localPaths, options);
+      }),
+  );
+
+  server.registerTool(
+    "create_project",
+    {
+      title: "Create project",
+      description: `Creates a project at the end of a projects showcase: title, subtitle (e.g. type and location), description, detail values by key, and categories. Use it for each job in a portfolio, then upload its photos with upload_photos and project. ${CONFIRM_FIRST} A project with the same title (or slug) is returned instead of a duplicate, and retries are safe; category names that don't exist yet are created.`,
+      inputSchema: {
+        showcaseId: idSchema("Projects showcase id from list_showcases or create_showcase."),
+        title: projectTitleSchema.describe("Project title, e.g. \"Arched Entry Two-Story\"."),
+        subtitle: projectSubtitleSchema,
+        description: projectDescriptionSchema,
+        slug: projectSlugSchema,
+        details: projectDetailValuesInputSchema,
+        categories: projectCategoriesSchema,
+      },
+      annotations: { title: "Create project", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    ({ showcaseId, ...input }) =>
+      run("create_project", async () => {
+        const { client } = await connect();
+        return createProject(client, showcaseId, input);
+      }),
+  );
+
+  server.registerTool(
+    "update_project",
+    {
+      title: "Update project",
+      description:
+        "Changes a project's title, subtitle, description, slug, detail values, categories, or cover photo. Use it to fill in or correct a project, e.g. with details from the old site. Pass only what changes: details merge (null clears one), categories replace the project's categories, and a new title keeps the slug unless you pass one (changing a slug breaks links to the old project page).",
+      inputSchema: {
+        showcaseId: idSchema("Projects showcase id from list_showcases."),
+        project: projectReferenceSchema("The project to change (slug, title, or id)"),
+        title: projectTitleSchema.optional().describe("New title, e.g. \"Arched Entry Two-Story\"."),
+        subtitle: projectSubtitleSchema,
+        description: projectDescriptionSchema,
+        slug: projectSlugSchema.describe("New URL form, only when the user wants it changed, e.g. \"arched-entry\"."),
+        details: projectDetailValuesInputSchema,
+        categories: projectCategoriesSchema.describe("The project's categories (replacing the current ones): names, slugs, or ids; missing names are created, e.g. [\"Custom Homes\"]."),
+        cover: z
+          .string()
+          .trim()
+          .min(1)
+          .max(ID_MAX_LENGTH)
+          .nullable()
+          .optional()
+          .describe(withExample("Item id of a photo in this project (from list_projects with project), or null to use its first ready photo", `"${EXAMPLE_ID}"`)),
+      },
+      annotations: { title: "Update project", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    ({ showcaseId, project, ...changes }) =>
+      run("update_project", async () => {
+        const { client } = await connect();
+        return updateProject(client, showcaseId, project, changes);
+      }),
+  );
+
+  server.registerTool(
+    "reorder_projects",
+    {
+      title: "Reorder projects",
+      description:
+        "Sets the order of a projects showcase's projects on the website. Use it when the user wants projects in a specific order, e.g. newest or featured first. Pass projects in the new order; ones you leave out keep their current order after them.",
+      inputSchema: {
+        showcaseId: idSchema("Projects showcase id from list_showcases."),
+        projects: z
+          .array(z.string().trim().min(1).max(PROJECT_REFERENCE_MAX_LENGTH))
+          .min(1)
+          .max(MAX_PROJECTS_PER_REORDER)
+          .describe("Projects (slugs, titles, or ids) in their new order, e.g. [\"arched-entry-two-story\", \"lakeside-remodel\"]."),
+      },
+      annotations: { title: "Reorder projects", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    ({ showcaseId, projects }) =>
+      run("reorder_projects", async () => {
+        const { client } = await connect();
+        return reorderProjects(client, showcaseId, projects);
+      }),
+  );
+
+  server.registerTool(
+    "reorder_project_items",
+    {
+      title: "Reorder project items",
+      description:
+        "Sets the order of the photos and videos inside one project. Use it to choose which photos lead a project page (the cover is set with update_project). Pass item ids in the new order (from list_projects with project; library video ids work too); ones you leave out keep their current order after them.",
+      inputSchema: {
+        showcaseId: idSchema("Projects showcase id from list_showcases."),
+        project: projectReferenceSchema("The project (slug, title, or id)"),
+        itemIds: z
+          .array(z.string().min(1).max(ID_MAX_LENGTH))
+          .min(1)
+          .max(MAX_ITEM_IDS_PER_CALL)
+          .describe(withExample("Item ids in their new order", `["${EXAMPLE_ID}"]`)),
+      },
+      annotations: { title: "Reorder project items", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    ({ showcaseId, project, itemIds }) =>
+      run("reorder_project_items", async () => {
+        const { client } = await connect();
+        return reorderProjectItems(client, showcaseId, project, itemIds);
+      }),
+  );
+
+  server.registerTool(
+    "get_project_details",
+    {
+      title: "Get project details",
+      description: `Reads the details a projects showcase defines for every project (facts like location, year, or square footage): each detail's key, label, type, unit, options, and whether it shows on cards, plus the version plan_project_details needs. Use it right before changing details or filling in values, since teammates edit them in the dashboard. Projects store values by key, and keys and option values never change.`,
+      inputSchema: { showcaseId: idSchema("Projects showcase id from list_showcases.") },
+      annotations: { title: "Get project details", readOnlyHint: true, openWorldHint: false },
+    },
+    ({ showcaseId }) =>
+      run("get_project_details", async () => {
+        const { client } = await connect();
+        return projectDetailsResult(showcaseId, await client.get<ProjectDetailsSchemaResponse>(projectDetailsPath(showcaseId)));
+      }),
+  );
+
+  server.registerTool(
+    "plan_project_details",
+    {
+      title: "Plan project details",
+      description: `Dry run: previews changing a projects showcase's details to the full list you pass and returns a plain-text summary, with changes that remove project values marked destructive. Use it whenever the user wants to add, rename, reorder, or remove project details; nothing is saved. ${PROJECT_DETAIL_EDIT_RULES.readFirst} ${PROJECT_DETAIL_EDIT_RULES.keepKeys} Show the summary to the user before apply_project_details.`,
+      inputSchema: {
+        showcaseId: idSchema("Projects showcase id from list_showcases."),
+        fields: projectDetailFieldsSchema.describe(PROJECT_DETAILS_FIELDS_DESCRIPTION),
+        expectedVersion: projectDetailsVersionSchema,
+      },
+      annotations: { title: "Plan project details", readOnlyHint: true, openWorldHint: false },
+    },
+    ({ showcaseId, fields, expectedVersion }) =>
+      run("plan_project_details", async () => {
+        const { client } = await connect();
+        return changeProjectDetails(client, showcaseId, { fields, expectedVersion, dryRun: true });
+      }),
+  );
+
+  server.registerTool(
+    "apply_project_details",
+    {
+      title: "Apply project details",
+      description: `Saves a change to a projects showcase's details: exactly the fields and expectedVersion you passed to plan_project_details. Use it once the user approved that plan. ${CONFIRM_FIRST} It's refused (SCHEMA_CHANGED) when someone changed the details since you read them, and (CONFIRMATION_REQUIRED) when it removes project values without confirmDestructive.`,
+      inputSchema: {
+        showcaseId: idSchema("Projects showcase id from list_showcases."),
+        fields: projectDetailFieldsSchema.describe(PROJECT_DETAILS_FIELDS_DESCRIPTION),
+        expectedVersion: projectDetailsVersionSchema,
+        confirmDestructive: z.boolean().optional().describe("Only after the user explicitly agreed to every destructive change in the plan, e.g. true."),
+      },
+      annotations: { title: "Apply project details", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    ({ showcaseId, fields, expectedVersion, confirmDestructive }) =>
+      run("apply_project_details", async () => {
+        const { client } = await connect();
+        return changeProjectDetails(client, showcaseId, { fields, expectedVersion, dryRun: false, confirmDestructive });
       }),
   );
 

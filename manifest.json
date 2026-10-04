@@ -50,7 +50,7 @@
     },
     {
       "name": "create_showcase",
-      "description": "Creates a showcase: an embeddable photo/video gallery the client can update from their phone."
+      "description": "Creates a showcase: an embeddable photo/video gallery, or a projects portfolio, the client can update from their phone."
     },
     {
       "name": "get_showcase",
@@ -78,7 +78,7 @@
     },
     {
       "name": "upload_photos",
-      "description": "Uploads local photos (JPEG, PNG, WebP, AVIF, HEIC; up to 20 MB each) into a showcase, straight to storage."
+      "description": "Uploads local photos (JPEG, PNG, WebP, AVIF, HEIC; up to 20 MB each) into a showcase or one of its projects, straight to storage."
     },
     {
       "name": "list_videos",
@@ -102,7 +102,39 @@
     },
     {
       "name": "plan_migration",
-      "description": "Scans a local folder without uploading and proposes how to bring it into Dropl: categories, counts and sizes, unsupported files, and upload batches."
+      "description": "Scans a local folder without uploading and proposes how to bring it into Dropl: categories or one project per folder, counts and sizes, unsupported files, and upload batches."
+    },
+    {
+      "name": "list_projects",
+      "description": "Lists a projects showcase's projects in order, or one project with its photos and videos."
+    },
+    {
+      "name": "create_project",
+      "description": "Adds a project (title, subtitle, description, details, categories) to a projects showcase."
+    },
+    {
+      "name": "update_project",
+      "description": "Changes a project's title, subtitle, description, slug, cover, details, or categories."
+    },
+    {
+      "name": "reorder_projects",
+      "description": "Sets the order of the projects in a projects showcase."
+    },
+    {
+      "name": "reorder_project_items",
+      "description": "Sets the order of the photos and videos inside one project."
+    },
+    {
+      "name": "get_project_details",
+      "description": "Reads a projects showcase's custom project details (fields like location or year) and their version."
+    },
+    {
+      "name": "plan_project_details",
+      "description": "Previews a change to a showcase's project details without saving, flagging destructive changes."
+    },
+    {
+      "name": "apply_project_details",
+      "description": "Saves a confirmed change to a showcase's project details, guarded by the version you read."
     },
     {
       "name": "list_collections",

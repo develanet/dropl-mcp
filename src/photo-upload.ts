@@ -21,8 +21,9 @@ import { chunk, mapWithConcurrency } from "./concurrency.js";
 import { describeError, UserFacingError } from "./errors.js";
 import { collectFiles, type LocalFile } from "./files.js";
 import { deriveIdempotencyKey } from "./idempotency.js";
-import { UploadManifest, manifestPath, photoManifestName, type PhotoManifestEntry } from "./manifest.js";
+import { UploadManifest, manifestPath, photoManifestKey, photoManifestName, type PhotoManifestEntry } from "./manifest.js";
 import { classifyPhoto, mediaKindOf } from "./media.js";
+import { resolveUploadProject, type ProjectTarget } from "./projects.js";
 import { isRetriableStorageStatus, retryDelayMs } from "./retry.js";
 import { LocalReadError, StoragePutError } from "./storage-put.js";
 import {
@@ -67,12 +68,16 @@ export interface UploadPhotosInput {
   recursive?: boolean;
   categoryFromFolder?: boolean;
   categories?: string[];
+  /** Projects showcases: the project (slug, title, or id) the photos join. */
+  project?: string;
   dryRun?: boolean;
 }
 
 export interface PhotoUploadSummary {
   showcaseId: string;
   showcaseTitle: string;
+  /** The project the photos go into; null for gallery showcases. */
+  project: ProjectTarget | null;
   dryRun: boolean;
   /** Dry run: what would be uploaded. */
   toUpload: number;
@@ -97,6 +102,8 @@ export interface PhotoUploadSummary {
 
 interface PlannedPhoto {
   file: LocalFile;
+  /** `photoManifestKey` of the file and the target project. */
+  manifestKey: string;
   contentType: GalleryImageContentType;
   categoryNames: string[];
   /** Normalized; undefined when the caller didn't set it. */
@@ -124,6 +131,7 @@ class PhotoUploadRun {
   constructor(
     private readonly context: MediaUploadContext,
     private readonly showcaseId: string,
+    private readonly projectId: string | null,
     private readonly manifest: UploadManifest<PhotoManifestEntry>,
     private readonly progressTotal: number,
   ) {
@@ -133,10 +141,11 @@ class PhotoUploadRun {
   }
 
   private setManifest(photo: PlannedPhoto, imageId: string, status: PhotoManifestEntry["status"]): void {
-    this.manifest.set(photo.file.fingerprint, {
+    this.manifest.set(photo.manifestKey, {
       path: photo.file.absolutePath,
       imageId,
       status,
+      ...(this.projectId !== null && { projectId: this.projectId }),
       updatedAt: new Date(this.context.now()).toISOString(),
     });
   }
@@ -170,6 +179,7 @@ class PhotoUploadRun {
   /** Returns the photos whose upload URLs were refused, to be presigned again. */
   private async uploadBatch(photos: PlannedPhoto[], round: number): Promise<PlannedPhoto[]> {
     const body: CreateGalleryUploadsRequest = {
+      ...(this.projectId !== null && { projectId: this.projectId }),
       files: photos.map((photo) => ({
         fileName: uploadFileName(photo.file.fileName),
         contentType: photo.contentType,
@@ -178,13 +188,14 @@ class PhotoUploadRun {
       })),
     };
     const fingerprints = photos.map((photo) => photo.file.fingerprint);
-    // Alt text joins the key only when set, so batches without it keep the keys earlier versions sent.
+    // Alt text and the project join the key only when set, so gallery batches keep the keys earlier versions sent.
     const altTexts = photos.map((photo) => photo.altText ?? null);
     const altTextKey = altTexts.some((altText) => altText !== null) ? [altTexts] : [];
+    const projectKey = this.projectId !== null ? [{ projectId: this.projectId }] : [];
 
     let targets: GalleryUploadTarget[];
     try {
-      targets = await this.presign(body, fingerprints, round, altTextKey);
+      targets = await this.presign(body, fingerprints, round, [...altTextKey, ...projectKey]);
     } catch (error) {
       const message = describeError(error);
       if (isBlockingError(error)) this.stoppedReason = message;
@@ -210,10 +221,10 @@ class PhotoUploadRun {
         this.setManifest(photo, targets[index]!.imageId, "uploaded");
       } else if (outcome.kind === "expired") {
         expired.push(photo);
-        this.manifest.delete(photo.file.fingerprint);
+        this.manifest.delete(photo.manifestKey);
       } else {
         this.fail(photo, outcome.error);
-        this.manifest.delete(photo.file.fingerprint);
+        this.manifest.delete(photo.manifestKey);
       }
     });
     await this.manifest.save();
@@ -306,7 +317,7 @@ class PhotoUploadRun {
           this.setManifest(entry.photo, entry.imageId, "failed");
         } else if (!image || image.status === "uploading") {
           this.fail(entry.photo, PHOTO_NOT_SAVED_MESSAGE);
-          this.manifest.delete(entry.photo.file.fingerprint);
+          this.manifest.delete(entry.photo.manifestKey);
         } else {
           this.uploadedImageIds.set(entry.photo.file.fingerprint, entry.imageId);
           this.setManifest(entry.photo, entry.imageId, "completed");
@@ -379,7 +390,7 @@ export async function uploadPhotos(input: UploadPhotosInput, context: MediaUploa
   const fileOptions = await resolveFileOptions(fileEntries, cwd, recursive);
 
   const rejected: RejectedFile[] = rejectedFromSkipped(collected.skipped);
-  const planned: PlannedPhoto[] = [];
+  const scanned: Omit<PlannedPhoto, "manifestKey">[] = [];
   let videosIgnored = 0;
   for (const file of collected.files) {
     const kind = mediaKindOf(file.fileName);
@@ -393,7 +404,7 @@ export async function uploadPhotos(input: UploadPhotosInput, context: MediaUploa
       continue;
     }
     const options = fileOptions.get(file.absolutePath);
-    planned.push({
+    scanned.push({
       file,
       contentType: classification.contentType,
       categoryNames: categoryNamesFor(file, [...explicitCategories, ...(options?.categoryNames ?? [])], input.categoryFromFolder ?? false),
@@ -402,6 +413,9 @@ export async function uploadPhotos(input: UploadPhotosInput, context: MediaUploa
   }
 
   const showcase = await context.client.get<GalleryDetail>(showcasePath(input.showcaseId), { signal: context.signal });
+  const usesCategories = explicitCategories.length > 0 || input.categoryFromFolder === true || fileEntries.some((entry) => (entry.categories?.length ?? 0) > 0);
+  const project = resolveUploadProject(showcase, input.project, usesCategories);
+  const planned: PlannedPhoto[] = scanned.map((photo) => ({ ...photo, manifestKey: photoManifestKey(photo.file.fingerprint, project?.id ?? null) }));
   const manifest = await UploadManifest.load<PhotoManifestEntry>(
     manifestPath(context.configDirectory, photoManifestName(input.showcaseId)),
     context.client.apiUrl,
@@ -417,7 +431,7 @@ export async function uploadPhotos(input: UploadPhotosInput, context: MediaUploa
   /** Known before uploading: files already in the showcase (finished or failed) and ones waiting to be completed. */
   const knownRecords = new Map<string, UploadedFileRecord>();
   for (const photo of planned) {
-    const entry = manifest.get(photo.file.fingerprint);
+    const entry = manifest.get(photo.manifestKey);
     const item = entry ? itemsById.get(entry.imageId) : undefined;
     const displayPath = photo.file.displayPath;
     if (!entry || !item) {
@@ -446,11 +460,14 @@ export async function uploadPhotos(input: UploadPhotosInput, context: MediaUploa
 
   const categoryNames = [...new Set([...toUpload, ...toComplete.map((entry) => entry.photo), ...alreadyUploaded.map((entry) => entry.photo)].flatMap((photo) => photo.categoryNames))];
   const batchCount = Math.ceil(toUpload.length / MAX_GALLERY_UPLOADS_PER_REQUEST);
-  const moreIdsHint = `Call list_showcase_items with showcaseId "${showcase.id}" to page through every item with its local path, id, alt text, and categories.`;
+  const moreIdsHint = project
+    ? `Call list_projects with showcaseId "${showcase.id}" and project "${project.slug}" to page through the project's items with their local paths, ids, and alt text.`
+    : `Call list_showcase_items with showcaseId "${showcase.id}" to page through every item with its local path, id, alt text, and categories.`;
   const fileList = (recordFor: (photo: PlannedPhoto) => UploadedFileRecord) => summarizeFileIds(planned.map(recordFor), moreIdsHint);
   const baseSummary = {
     showcaseId: showcase.id,
     showcaseTitle: showcase.title,
+    project,
     toUpload: toUpload.length + toComplete.length,
     alreadyUploaded: alreadyUploaded.length,
     rejected: summarizeRejected(rejected),
@@ -478,7 +495,9 @@ export async function uploadPhotos(input: UploadPhotosInput, context: MediaUploa
       stoppedReason: null,
       warnings,
       nextSteps: [
-        "Show this plan to the user and ask for confirmation before uploading.",
+        project
+          ? `Show this plan to the user (the photos go into project "${project.title}") and ask for confirmation before uploading.`
+          : "Show this plan to the user and ask for confirmation before uploading.",
         "Then call upload_photos again with the same arguments and dryRun: false.",
       ],
     };
@@ -487,7 +506,7 @@ export async function uploadPhotos(input: UploadPhotosInput, context: MediaUploa
 
   const categories = categoryNames.length > 0 ? await ensureCategories(context.client, showcase.id, categoryNames, showcase.categories) : new Map<string, CategoryRef>();
 
-  const run = new PhotoUploadRun(context, showcase.id, manifest, toUpload.length + toComplete.length);
+  const run = new PhotoUploadRun(context, showcase.id, project?.id ?? null, manifest, toUpload.length + toComplete.length);
   if (toComplete.length > 0) await run.complete(toComplete);
   await run.uploadAll(toUpload);
 

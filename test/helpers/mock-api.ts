@@ -2,13 +2,24 @@ import { createHash } from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import {
+  MAX_GALLERY_PROJECTS,
+  PROJECT_ERROR_CODES,
+  applyProjectDetailChanges,
+  availableProjectSlug,
+  describeProjectDetailChanges,
+  diffProjectDetailFields,
+  isDestructiveProjectDetailChange,
+  migrateProjectDetailValues,
+  resolveProjectDetailFields,
   slugifyCategoryName,
+  slugifyProjectTitle,
   type FeedbackAttachmentSummary,
   type FeedbackMessageSummary,
   type FeedbackRequestDetail,
   type GalleryCategorySummary,
   type GalleryDetail,
   type GalleryImageSummary,
+  type GalleryProjectSummary,
   type PublicApiSite,
 } from "@dropl/shared";
 
@@ -142,9 +153,14 @@ function photoItem(id: string, fileName: string, position: number): GalleryImage
     sourceFileName: fileName,
     categoryIds: [],
     video: null,
+    projectId: null,
     createdAt: new Date().toISOString(),
   };
 }
+
+type MockShowcase = GalleryDetail & { siteId: string };
+
+const apiError = (status: number, code: string, message: string): [number, unknown] => [status, { error: { code, message } }];
 
 /** Just enough of the public API v1 contract, plus a fake storage endpoint, for the MCP tests. */
 export class MockDroplApi {
@@ -155,7 +171,7 @@ export class MockDroplApi {
   private readonly faults: Fault[] = [];
   private readonly idempotency = new Map<string, { bodyHash: string; status: number; body: unknown }>();
   readonly sites: PublicApiSite[] = [{ id: "site1", name: "Acme", isDefault: true, domains: [], canEdit: true }];
-  readonly showcases = new Map<string, GalleryDetail & { siteId: string }>();
+  readonly showcases = new Map<string, MockShowcase>();
   readonly sessions = new Map<string, VideoSession>();
   readonly videos = new Map<string, { id: string; publicId: string; title: string; deletedAt: string | null }>();
   private readonly photoBytes = new Map<string, number>();
@@ -188,7 +204,7 @@ export class MockDroplApi {
 
   addShowcase(siteId = "site1", overrides: Partial<GalleryDetail> = {}): GalleryDetail {
     const id = nextId("sc");
-    const showcase: GalleryDetail & { siteId: string } = {
+    const showcase: MockShowcase = {
       id,
       publicId: `pub${id}`,
       title: "Portfolio",
@@ -208,11 +224,71 @@ export class MockDroplApi {
       pageSize: 9,
       categories: [],
       images: [],
+      type: "gallery",
+      projectCount: 0,
+      projectDetailFields: [],
+      projectDetailsVersion: 1,
+      projects: [],
       siteId,
       ...overrides,
     };
     this.showcases.set(id, showcase);
     return showcase;
+  }
+
+  /** Appends a project the way `POST .../projects` does. */
+  addProject(showcase: GalleryDetail, overrides: Partial<GalleryProjectSummary> & { title: string }): GalleryProjectSummary {
+    const slug = overrides.slug ?? availableProjectSlug(slugifyProjectTitle(overrides.title), new Set(showcase.projects.map((project) => project.slug)));
+    const project: GalleryProjectSummary = {
+      id: nextId("prj"),
+      subtitle: null,
+      description: null,
+      coverImageId: null,
+      coverUrl: null,
+      position: showcase.projects.length,
+      details: {},
+      categoryIds: [],
+      itemCount: 0,
+      readyItemCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      ...overrides,
+      slug,
+    };
+    showcase.projects.push(project);
+    showcase.projectCount = showcase.projects.length;
+    return project;
+  }
+
+  private projectItems(showcase: GalleryDetail, projectId: string): GalleryImageSummary[] {
+    return showcase.images.filter((item) => item.projectId === projectId).sort((left, right) => left.position - right.position);
+  }
+
+  private refreshProjectCounts(showcase: GalleryDetail): void {
+    for (const project of showcase.projects) {
+      const items = this.projectItems(showcase, project.id);
+      project.itemCount = items.length;
+      project.readyItemCount = items.filter((item) => item.status === "ready").length;
+    }
+  }
+
+  private projectList(showcase: MockShowcase) {
+    this.refreshProjectCounts(showcase);
+    return {
+      showcaseId: showcase.id,
+      type: showcase.type,
+      detailFields: showcase.projectDetailFields,
+      detailsVersion: showcase.projectDetailsVersion,
+      projects: showcase.projects.map((project) => ({ ...project, items: this.projectItems(showcase, project.id) })),
+    };
+  }
+
+  /** Null when the item may be added; otherwise the error response for its `projectId`. */
+  private checkItemProject(showcase: GalleryDetail, projectId: string | undefined): [number, unknown] | null {
+    if (showcase.type === "projects" && !projectId) return apiError(400, PROJECT_ERROR_CODES.projectRequired, "Items in a projects showcase need a projectId.");
+    if (showcase.type !== "projects" && projectId) return apiError(400, PROJECT_ERROR_CODES.notProjectsShowcase, "This showcase has no projects.");
+    if (projectId && !showcase.projects.some((project) => project.id === projectId)) return apiError(404, PROJECT_ERROR_CODES.projectNotFound, "Project not found.");
+    return null;
   }
 
   requestsTo(method: string, pattern: RegExp): RecordedRequest[] {
@@ -362,7 +438,10 @@ export class MockDroplApi {
       const showcase = this.showcases.get(match[1]!);
       if (!showcase) return notFound;
       const rest = match[2] ?? "";
-      if (rest === "" && method === "GET") return [200, showcase];
+      if (rest === "" && method === "GET") {
+        this.refreshProjectCounts(showcase);
+        return [200, showcase];
+      }
       if (rest === "" && method === "PATCH") {
         Object.assign(showcase, body);
         return [200, showcase];
@@ -372,7 +451,7 @@ export class MockDroplApi {
         if (showcase.categories.some((category) => category.slug === slug)) {
           return [409, { error: { code: "CATEGORY_EXISTS", message: "A category with this slug exists." } }];
         }
-        const category: GalleryCategorySummary = { id: nextId("cat"), name: body.name, slug, position: showcase.categories.length, itemCount: 0 };
+        const category: GalleryCategorySummary = { id: nextId("cat"), name: body.name, slug, position: showcase.categories.length, itemCount: 0, projectCount: 0 };
         showcase.categories.push(category);
         return [201, category];
       }
@@ -406,6 +485,8 @@ export class MockDroplApi {
         return [200, { items }];
       }
       if (rest === "/videos" && method === "POST") {
+        const refused = this.checkItemProject(showcase, body.projectId);
+        if (refused) return refused;
         for (const videoId of body.videoIds) {
           const video = this.videos.get(videoId);
           if (!video || showcase.images.some((item) => item.video?.id === videoId)) continue;
@@ -414,14 +495,18 @@ export class MockDroplApi {
             kind: "video",
             status: "ready",
             video: { id: video.id, publicId: video.publicId, title: video.title, durationMs: null, availability: "processing" },
+            projectId: body.projectId ?? null,
           });
         }
         return [200, showcase];
       }
+      if (rest.startsWith("/project")) return this.routeProjects(method, rest, showcase, body);
       if (rest === "/photos/uploads" && method === "POST") {
+        const refused = this.checkItemProject(showcase, body.projectId);
+        if (refused) return refused;
         const uploads = body.files.map((file: { fileName: string; contentType: string; altText?: string | null }) => {
           const imageId = nextId("img");
-          showcase.images.push({ ...photoItem(imageId, file.fileName, showcase.images.length), altText: file.altText || null });
+          showcase.images.push({ ...photoItem(imageId, file.fileName, showcase.images.length), altText: file.altText || null, projectId: body.projectId ?? null });
           return { imageId, uploadUrl: `${this.origin}/storage/photo/${imageId}`, headers: { "Content-Type": file.contentType } };
         });
         return [201, { uploads, expiresAt: new Date(Date.now() + 3_600_000).toISOString() }];
@@ -432,13 +517,18 @@ export class MockDroplApi {
         return [200, { images }];
       }
       if (rest === "/embed" && method === "GET") {
-        const html = (category?: string) =>
-          `<div data-dropl-showcase="${showcase.publicId}"${category ? ` data-category="${category}"` : ""}></div>\n<script src="${this.origin}/embed/showcase.js" async></script>`;
+        const projectUrl = url.searchParams.get("projectUrl");
+        const html = (attributes = "") => `<div data-dropl-showcase="${showcase.publicId}"${attributes}></div>\n<script src="${this.origin}/embed/showcase.js" async></script>`;
+        const isProjects = showcase.type === "projects";
         return [200, {
           showcaseId: showcase.id,
           publicId: showcase.publicId,
-          html: html(),
-          categories: showcase.categories.map((category) => ({ id: category.id, name: category.name, slug: category.slug, html: html(category.slug) })),
+          type: showcase.type,
+          html: html(isProjects && projectUrl ? ` data-project-url="${projectUrl}"` : ""),
+          categories: showcase.categories.map((category) => ({ id: category.id, name: category.name, slug: category.slug, html: html(` data-category="${category.slug}"`) })),
+          ...(isProjects && {
+            projects: showcase.projects.map((project) => ({ id: project.id, title: project.title, slug: project.slug, html: html(` data-project="${project.slug}"`) })),
+          }),
           notes: ["Photos still processing appear once ready."],
         }];
       }
@@ -530,6 +620,79 @@ export class MockDroplApi {
       }];
     }
     return this.routeCollections(method, path, body) ?? this.routeFeedback(method, path, body) ?? notFound;
+  }
+
+  /** `/v1/showcases/:id/projects…` and `/v1/showcases/:id/project-details`, following the projects contract. */
+  private routeProjects(method: string, rest: string, showcase: MockShowcase, body: any): [number, unknown] {
+    const notFound = apiError(404, "NOT_FOUND", "Not found.");
+    if (rest === "/project-details") {
+      if (method === "GET") return [200, { fields: showcase.projectDetailFields, version: showcase.projectDetailsVersion }];
+      if (method !== "PUT") return notFound;
+      if (body.expectedVersion !== showcase.projectDetailsVersion) return apiError(409, PROJECT_ERROR_CODES.schemaChanged, "The project details changed since you read them.");
+      const { fields, issues } = resolveProjectDetailFields(showcase.projectDetailFields, body.fields);
+      if (issues.length > 0) return apiError(400, PROJECT_ERROR_CODES.invalidDetails, issues.map((issue) => issue.message).join(" "));
+      const changes = diffProjectDetailFields(showcase.projectDetailFields, fields, showcase.projects.map((project) => project.details));
+      const summary = describeProjectDetailChanges(changes);
+      if (body.dryRun) return [200, { applied: false, fields, version: showcase.projectDetailsVersion, changes, summary }];
+      if (isDestructiveProjectDetailChange(changes) && !body.confirmDestructive) {
+        return apiError(409, PROJECT_ERROR_CODES.confirmationRequired, "This change removes values projects have.");
+      }
+      showcase.projectDetailFields = fields;
+      showcase.projectDetailsVersion += 1;
+      for (const project of showcase.projects) project.details = migrateProjectDetailValues(fields, project.details);
+      return [200, { applied: true, fields, version: showcase.projectDetailsVersion, changes, summary }];
+    }
+
+    if (showcase.type !== "projects") return apiError(400, PROJECT_ERROR_CODES.notProjectsShowcase, "This showcase has no projects.");
+    if (rest === "/projects" && method === "GET") return [200, this.projectList(showcase)];
+    if (rest === "/projects" && method === "POST") {
+      if (showcase.projects.length >= MAX_GALLERY_PROJECTS) return apiError(409, PROJECT_ERROR_CODES.tooManyProjects, "This showcase has the most projects it can hold.");
+      if (body.slug && showcase.projects.some((project) => project.slug === body.slug)) return apiError(409, PROJECT_ERROR_CODES.projectSlugTaken, "Another project uses this slug.");
+      const details = applyProjectDetailChanges(showcase.projectDetailFields, {}, body.details ?? {});
+      if (!details.ok) return apiError(400, PROJECT_ERROR_CODES.invalidDetails, details.issues.map((issue) => issue.message).join(" "));
+      const project = this.addProject(showcase, {
+        title: body.title,
+        subtitle: body.subtitle ?? null,
+        description: body.description ?? null,
+        ...(body.slug && { slug: body.slug }),
+        details: details.values,
+        categoryIds: body.categoryIds ?? [],
+      });
+      return [201, project];
+    }
+    if (rest === "/projects/order" && method === "PUT") {
+      const currentIds = showcase.projects.map((project) => project.id).sort();
+      if ([...body.projectIds].sort().join() !== currentIds.join()) return apiError(400, "INVALID_ORDER", "List every project exactly once.");
+      showcase.projects.sort((left, right) => body.projectIds.indexOf(left.id) - body.projectIds.indexOf(right.id));
+      showcase.projects.forEach((project, index) => (project.position = index));
+      return [200, this.projectList(showcase)];
+    }
+    const projectMatch = /^\/projects\/([^/]+)(\/items\/order)?$/.exec(rest);
+    const project = projectMatch ? showcase.projects.find((candidate) => candidate.id === projectMatch[1]) : undefined;
+    if (!projectMatch) return notFound;
+    if (!project) return apiError(404, PROJECT_ERROR_CODES.projectNotFound, "Project not found.");
+    if (projectMatch[2] && method === "PUT") {
+      const items = this.projectItems(showcase, project.id);
+      if ([...body.imageIds].sort().join() !== items.map((item) => item.id).sort().join()) return apiError(400, "INVALID_ORDER", "List every item of the project exactly once.");
+      const positions = items.map((item) => item.position).sort((left, right) => left - right);
+      body.imageIds.forEach((id: string, index: number) => (items.find((item) => item.id === id)!.position = positions[index]!));
+      return [200, { ...project, items: this.projectItems(showcase, project.id) }];
+    }
+    if (!projectMatch[2] && method === "PATCH") {
+      if (body.slug && showcase.projects.some((candidate) => candidate.id !== project.id && candidate.slug === body.slug)) {
+        return apiError(409, PROJECT_ERROR_CODES.projectSlugTaken, "Another project uses this slug.");
+      }
+      const { details: detailChanges, ...changes } = body;
+      if (detailChanges) {
+        const details = applyProjectDetailChanges(showcase.projectDetailFields, project.details, detailChanges);
+        if (!details.ok) return apiError(400, PROJECT_ERROR_CODES.invalidDetails, details.issues.map((issue) => issue.message).join(" "));
+        project.details = details.values;
+      }
+      Object.assign(project, changes, { updatedAt: new Date().toISOString() });
+      this.refreshProjectCounts(showcase);
+      return [200, project];
+    }
+    return notFound;
   }
 
   private routeFeedback(method: string, path: string, body: any): [number, unknown] | null {

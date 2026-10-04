@@ -1,6 +1,6 @@
 {
   "name": "@dropl/mcp",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Create client-editable photo and video galleries from Cursor or Claude Code, then embed them.",
   "mcpName": "io.dropl/mcp",
   "keywords": [

@@ -1,8 +1,16 @@
-import { slugifyCategoryName, type PublicApiShowcaseEmbedResponse, type PublicApiVideoEmbedResponse } from "@dropl/shared";
+import {
+  collapseWhitespace,
+  slugifyCategoryName,
+  slugifyProjectTitle,
+  type PublicApiShowcaseEmbedResponse,
+  type PublicApiVideoEmbedResponse,
+} from "@dropl/shared";
 import { UserFacingError } from "./errors.js";
+import { truncateList } from "./format.js";
 
 const SCRIPT_SRC_PATTERN = /<script\b[^>]*\bsrc="([^"]+)"/i;
 const CONTAINER_PATTERN = /^\s*(<div\b[^>]*><\/div>)/i;
+const MAX_LISTED_PROJECT_SNIPPETS = 20;
 
 /** Short, accurate placement advice; the loader also mounts containers added later (client-side navigation). */
 export const EMBED_PLACEMENT_GUIDE: readonly string[] = [
@@ -30,6 +38,12 @@ export interface EmbedCodeResult {
   scriptSrc: string | null;
   category: { id: string; name: string; slug: string } | null;
   otherCategorySnippets: { name: string; slug: string }[];
+  /** Projects showcases only. */
+  type?: "projects";
+  project?: { id: string; title: string; slug: string } | null;
+  projectUrl?: string | null;
+  /** Other projects with a page snippet (get_embed_code with project). */
+  projectSnippets?: { title: string; slug: string }[];
   embeddable?: boolean;
   watchUrl?: string | null;
   notes: string[];
@@ -53,8 +67,54 @@ export function videoEmbedResult(response: PublicApiVideoEmbedResponse): EmbedCo
   };
 }
 
-/** With `category` (name or slug), returns that category's snippet, which shows only its items without filter tabs. */
-export function showcaseEmbedResult(response: PublicApiShowcaseEmbedResponse, category?: string): EmbedCodeResult {
+export interface ShowcaseEmbedOptions {
+  /** Name or slug: that category's snippet, which shows only its items without filter tabs. */
+  category?: string;
+  /** Projects showcases: slug, title, or id of the project whose page snippet to return. */
+  project?: string;
+  /** The `projectUrl` template the response was requested with, e.g. `/work/{slug}`. */
+  projectUrl?: string;
+}
+
+type ProjectSnippet = NonNullable<PublicApiShowcaseEmbedResponse["projects"]>[number];
+
+function findProjectSnippet(snippets: readonly ProjectSnippet[], reference: string): ProjectSnippet {
+  const wanted = collapseWhitespace(reference);
+  const match =
+    snippets.find((entry) => entry.id === wanted || entry.slug === wanted) ??
+    snippets.find((entry) => collapseWhitespace(entry.title).toLowerCase() === wanted.toLowerCase()) ??
+    snippets.find((entry) => entry.slug === slugifyProjectTitle(wanted));
+  if (match) return match;
+  const available = truncateList(snippets, MAX_LISTED_PROJECT_SNIPPETS);
+  const listed = available.items.map((entry) => `${entry.title} (${entry.slug})`).join(", ") || "none";
+  throw new UserFacingError(`This showcase has no project "${reference}". Projects: ${listed}${available.omitted > 0 ? `, and ${available.omitted} more` : ""}.`);
+}
+
+function projectNotes(projectUrl: string | undefined, selected: ProjectSnippet | null): string[] {
+  const notes = [
+    "This is a projects showcase: the main snippet shows the projects index and opens each project's page in place.",
+  ];
+  if (selected) notes.push(`This snippet shows only the "${selected.title}" project page; put it on that project's own page of the website.`);
+  if (projectUrl) {
+    notes.push(
+      `With projectUrl, index cards link to ${projectUrl} on the website instead of opening in place, so each project needs that page: embed its project snippet there (get_embed_code with project). For a dynamic route such as /work/[slug], render the project snippet's container with its data-project attribute set to the page's slug.`,
+    );
+  } else {
+    notes.push('To give each project its own page on the website (better for search), call get_embed_code again with projectUrl, e.g. "/work/{slug}", and add those pages.');
+  }
+  return notes;
+}
+
+export function showcaseEmbedResult(response: PublicApiShowcaseEmbedResponse, options: ShowcaseEmbedOptions = {}): EmbedCodeResult {
+  const { category, project, projectUrl } = options;
+  const isProjects = response.type === "projects";
+  if (!isProjects && (project || projectUrl)) {
+    throw new UserFacingError("project and projectUrl only apply to projects showcases; this one is a gallery.");
+  }
+  if (category?.trim() && project?.trim()) throw new UserFacingError("Pass either category or project, not both.");
+  const projectSnippets = response.projects ?? [];
+  const selectedProject = project?.trim() ? findProjectSnippet(projectSnippets, project) : null;
+
   let selected: PublicApiShowcaseEmbedResponse["categories"][number] | null = null;
   if (category?.trim()) {
     const wanted = category.trim().toLowerCase();
@@ -65,7 +125,7 @@ export function showcaseEmbedResult(response: PublicApiShowcaseEmbedResponse, ca
       throw new UserFacingError(`This showcase has no category "${category}". Categories: ${available}.`);
     }
   }
-  const html = selected?.html ?? response.html;
+  const html = selectedProject?.html ?? selected?.html ?? response.html;
   return {
     kind: "showcase",
     id: response.showcaseId,
@@ -75,7 +135,13 @@ export function showcaseEmbedResult(response: PublicApiShowcaseEmbedResponse, ca
     scriptSrc: scriptSource(html),
     category: selected ? { id: selected.id, name: selected.name, slug: selected.slug } : null,
     otherCategorySnippets: response.categories.filter((entry) => entry.id !== selected?.id).map((entry) => ({ name: entry.name, slug: entry.slug })),
-    notes: response.notes,
+    ...(isProjects && {
+      type: "projects" as const,
+      project: selectedProject ? { id: selectedProject.id, title: selectedProject.title, slug: selectedProject.slug } : null,
+      projectUrl: projectUrl ?? null,
+      projectSnippets: projectSnippets.filter((entry) => entry.id !== selectedProject?.id).map((entry) => ({ title: entry.title, slug: entry.slug })),
+    }),
+    notes: isProjects ? [...response.notes, ...projectNotes(projectUrl, selectedProject)] : response.notes,
     whereToPaste: EMBED_PLACEMENT_GUIDE,
   };
 }

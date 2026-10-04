@@ -40,6 +40,17 @@ Don't create or upload anything until the user has seen the plan and explicitly 
 3. Ask the user before deleting the original media files from the repo. Other pages may still use them.
 4. Run the project's build (or type check) to make sure it still compiles.
 
+## Portfolios with a page per project
+
+When the site shows projects (one folder per project, each with its own title, description, and photos, for example `public/projects/<project>/`), use a projects showcase instead of a gallery with categories.
+
+1. Call `plan_migration` on the folder that holds the project folders, with `layout` set to `projects` (it picks this layout on its own when the folder has a `projects/` subfolder of project folders). It lists each project's folder, `path`, title (from the folder name), slug, and photo and video counts. Show the user the project titles and slugs and let them correct them before anything is created.
+2. Call `create_showcase` with `type` set to `projects`.
+3. If the projects share facts such as location, year, or size, call `get_project_details`, then `plan_project_details` to preview the details (nothing is saved), and `apply_project_details` with the `expectedVersion` you read once the user confirms. Always read the current details first and never revert edits made in the dashboard. Keep existing keys and option values exactly; only labels can be renamed. Pass `confirmDestructive` only after the user explicitly agrees to every change that removes values.
+4. For each project, in the planned order, call `create_project` with its `title`, `slug`, and, when the site has them, `subtitle`, `description`, `details`, and `categories`. Then call `upload_photos` with the `showcaseId`, the `project` slug, and that project's folder as `paths` (`dryRun: true` first). For videos, call `upload_videos` with `project` too. Categories belong to projects here, not to photos, so leave out `categoryFromFolder`.
+5. Use `list_projects` to check each project, `update_project` to fix a title or pick a `cover`, and `reorder_projects` or `reorder_project_items` to match the old site's order.
+6. Call `get_embed_code` with the `showcaseId`. If the website should have a page per project (better for search), pass `projectUrl`, for example "/work/{slug}", add those pages, and embed each project's snippet there (`get_embed_code` with `project`). Follow the notes in the response.
+
 ## Report back
 
 Tell the user which showcases you created or reused, how many photos and videos you uploaded, anything that was skipped or failed, and which files you changed to add the embed.

@@ -114,20 +114,25 @@ Use a stdio server with command `npx` and arguments `["-y", "@dropl/mcp@latest"]
 
 | Tool | What it does |
 | --- | --- |
-| `plan_migration` | Scans a local folder without uploading anything. Returns per-folder photo/video counts and sizes, unsupported files, proposed categories, and the steps to run. |
+| `plan_migration` | Scans a local folder without uploading anything. Returns per-folder photo/video counts and sizes, unsupported files, proposed categories, and the steps to run. With `layout: "projects"` (or a `projects/` folder of project folders), plans one project per folder with its title, slug, and counts. |
 | `whoami` | Connected account, user, role, key name/prefix, scopes, and site restriction. |
 | `list_sites` / `create_site` | List client sites, or create one (name, optional domain). |
-| `list_showcases` / `create_showcase` | List a site's showcases, or create one (title, layout, grid fit, category filters, page size). |
-| `get_showcase` / `update_showcase` | Summarize a showcase (items by status and category, photos without alt text, failures), or change its settings. |
+| `list_showcases` / `create_showcase` | List a site's showcases with their type and project counts, or create one (title, `type` gallery or projects, layout, grid fit, category filters, page size). |
+| `get_showcase` / `update_showcase` | Summarize a showcase (items by status and category, projects, photos without alt text, failures), or change its settings. |
 | `list_showcase_items` | Page through a showcase's items: id, kind, status, file name, the local path it was uploaded from, alt text, and categories. Filter by kind, missing alt text, category, or text. |
 | `update_items` | Set alt text and add or remove categories on many items in one call, by the ids uploads return (library video ids work too). Missing categories are created. |
 | `create_category` | Add a category to a showcase; an existing one with the same name is reused. |
 | `tag_items` | Add or remove categories on showcase items, by the ids uploads return. |
-| `upload_photos` | Upload photos from files, folders, or globs into a showcase, with optional alt text and categories per photo (`files`). Optionally creates categories from folders. Supports dry runs and resuming. Returns each file's showcase item id. |
+| `upload_photos` | Upload photos from files, folders, or globs into a showcase, with optional alt text and categories per photo (`files`). Optionally creates categories from folders. In a projects showcase, pass `project` to upload into that project. Supports dry runs and resuming. Returns each file's showcase item id. |
 | `list_videos` | List a site's videos. |
-| `upload_videos` | Upload videos to a site's library in resumable parts, and optionally add them to a showcase with categories. Returns each file's video id (and showcase item id). |
-| `add_videos_to_showcase` | Add existing library videos to a showcase. |
-| `get_embed_code` | The embed snippet for a video or a showcase (or one category), plus how to paste it in HTML, React/Next.js, WordPress, Webflow, and Framer. |
+| `upload_videos` | Upload videos to a site's library in resumable parts, and optionally add them to a showcase with categories (or to one of its projects with `project`). Returns each file's video id (and showcase item id). |
+| `add_videos_to_showcase` | Add existing library videos to a showcase, or to one of its projects. |
+| `get_embed_code` | The embed snippet for a video or a showcase (or one category or project), plus how to paste it in HTML, React/Next.js, WordPress, Webflow, and Framer. For projects showcases, `projectUrl` (e.g. `/work/{slug}`) links index cards to a page per project. |
+| `list_projects` | A projects showcase's projects in order (excerpt, details, categories, counts), or one project with its full description and its photos and videos. |
+| `create_project` / `update_project` | Add a project (title, subtitle, description, slug, details, categories), or change one, including its cover. An existing project with the same title or slug is reused. |
+| `reorder_projects` / `reorder_project_items` | Set the order of the projects, or of the photos and videos inside one project. Partial lists go first; the rest keep their order. |
+| `get_project_details` | A projects showcase's custom details (fields like location or year) and their `version`, including edits made in the dashboard. |
+| `plan_project_details` / `apply_project_details` | Preview a change to the project details without saving, then apply it with the `expectedVersion` you read. Keys never change; removing values needs `confirmDestructive`. |
 | `get_usage` | Storage and bandwidth used against your plan, and whether uploads are suspended. |
 | `list_collections` | A site's collections (menus, inventory, events) with item counts and plan limits. |
 | `get_collection_schema` | A collection's current fields and `schemaVersion`, including edits made in the dashboard. |

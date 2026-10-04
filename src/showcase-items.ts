@@ -26,6 +26,8 @@ export interface ShowcaseItemView {
   fileName: string | null;
   /** Where this MCP server uploaded it from, when it did. */
   localPath?: string;
+  /** Projects showcases: the slug of the item's project. */
+  project?: string;
   alt: string | null;
   categories: string[];
   videoId?: string;
@@ -92,13 +94,20 @@ export async function localPathsByItemId(
   return paths;
 }
 
-function itemView(item: GalleryImageSummary, categoryNames: Map<string, string>, localPath: string | undefined): ShowcaseItemView {
+export function itemView(
+  item: GalleryImageSummary,
+  categoryNames: Map<string, string>,
+  localPath: string | undefined,
+  projectSlugs: Map<string, string> = new Map(),
+): ShowcaseItemView {
+  const projectSlug = item.projectId ? projectSlugs.get(item.projectId) : undefined;
   return {
     id: item.id,
     kind: item.kind,
     status: item.status,
     fileName: item.video?.title ?? item.sourceFileName,
     ...(localPath && { localPath }),
+    ...(projectSlug && { project: projectSlug }),
     alt: item.altText,
     categories: item.categoryIds.flatMap((id) => categoryNames.get(id) ?? []),
     ...(item.video && { videoId: item.video.id }),
@@ -108,6 +117,7 @@ function itemView(item: GalleryImageSummary, categoryNames: Map<string, string>,
 
 export function listItemsResult(detail: GalleryDetail, localPaths: Map<string, string>, filters: ListItemsFilters) {
   const categoryNames = new Map(detail.categories.map((category) => [category.id, category.name]));
+  const projectSlugs = new Map((detail.projects ?? []).map((project) => [project.id, project.slug]));
   let category: GalleryCategorySummary | undefined;
   if (filters.category) {
     category = matchCategory(detail.categories, filters.category);
@@ -133,7 +143,7 @@ export function listItemsResult(detail: GalleryDetail, localPaths: Map<string, s
     nextOffset: offset + page.length < matching.length ? offset + page.length : null,
     photosWithoutAltText: detail.images.filter((item) => item.kind === "photo" && !item.altText).length,
     categories: detail.categories.map((entry) => ({ id: entry.id, name: entry.name, slug: entry.slug })),
-    items: page.map((item) => itemView(item, categoryNames, localPaths.get(item.id))),
+    items: page.map((item) => itemView(item, categoryNames, localPaths.get(item.id), projectSlugs)),
   };
 }
 

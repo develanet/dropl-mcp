@@ -18,12 +18,13 @@ import {
 import { pathSegment } from "./api-client.js";
 import { bulkTagItems, categoryKey, ensureCategories, normalizeCategoryName, showcasePath } from "./categories.js";
 import { chunk, mapWithConcurrency } from "./concurrency.js";
-import { DroplApiError, describeError } from "./errors.js";
+import { DroplApiError, UserFacingError, describeError } from "./errors.js";
 import { collectFiles, type LocalFile } from "./files.js";
 import { formatBytes, truncateList } from "./format.js";
 import { deriveIdempotencyKey } from "./idempotency.js";
 import { UploadManifest, manifestPath, videoManifestName, type VideoManifestEntry } from "./manifest.js";
 import { classifyVideo, mediaKindOf } from "./media.js";
+import { resolveUploadProject, type ProjectTarget } from "./projects.js";
 import { isRetriableStorageStatus, retryDelayMs } from "./retry.js";
 import { StoragePutError } from "./storage-put.js";
 import {
@@ -62,6 +63,8 @@ export interface UploadVideosInput {
   cwd?: string;
   recursive?: boolean;
   showcaseId?: string;
+  /** With a projects showcase: the project (slug, title, or id) the videos join. */
+  project?: string;
   categories?: string[];
   categoryFromFolder?: boolean;
   dryRun?: boolean;
@@ -84,6 +87,8 @@ export interface VideoUploadSummary {
   failed: FailedSummary;
   rejected: RejectedSummary;
   photosIgnored: number;
+  /** The showcase project the videos go into, or null. */
+  project: ProjectTarget | null;
   showcase: { id: string; videosAdded: number; categories: { name: string; id: string; created: boolean; tagged: number }[] } | null;
   /** Every accepted video's local path and library video id (plus its showcase item id), including ones already uploaded. */
   files: UploadedFileList;
@@ -380,6 +385,15 @@ export async function uploadVideos(input: UploadVideosInput, context: MediaUploa
   if (!input.showcaseId && (explicitCategories.length > 0 || input.categoryFromFolder)) {
     warnings.push("Categories only apply to videos in a showcase; pass showcaseId to add the videos to one.");
   }
+  if (!input.showcaseId && input.project) throw new UserFacingError("project only applies with showcaseId: pass the projects showcase the videos go into.");
+  // Checked before uploading, so a projects showcase without a project fails now rather than after every upload.
+  const project = input.showcaseId
+    ? resolveUploadProject(
+        await context.client.get<GalleryDetail>(showcasePath(input.showcaseId), { signal: context.signal }),
+        input.project,
+        explicitCategories.length > 0 || input.categoryFromFolder === true,
+      )
+    : null;
 
   if (input.dryRun) {
     const listed = truncateList(
@@ -396,6 +410,7 @@ export async function uploadVideos(input: UploadVideosInput, context: MediaUploa
       failed: summarizeFailed([]),
       rejected: summarizeRejected(rejected),
       photosIgnored,
+      project,
       showcase: null,
       files: summarizeFileIds(
         planned.map((video) => ({ path: video.file.displayPath, id: null, status: "pending" })),
@@ -403,7 +418,9 @@ export async function uploadVideos(input: UploadVideosInput, context: MediaUploa
       ),
       stoppedReason: null,
       warnings,
-      nextSteps: ["Show this plan to the user and ask for confirmation, then call upload_videos again with dryRun: false."],
+      nextSteps: [
+        `Show this plan to the user${project ? ` (the videos go into project "${project.title}")` : ""} and ask for confirmation, then call upload_videos again with dryRun: false.`,
+      ],
     };
   }
 
@@ -446,7 +463,7 @@ export async function uploadVideos(input: UploadVideosInput, context: MediaUploa
   let showcase: VideoUploadSummary["showcase"] = null;
   const finished = [...uploaded, ...skipped];
   if (input.showcaseId && finished.length > 0) {
-    const added = await addToShowcase(context, input.showcaseId, finished, warnings);
+    const added = await addToShowcase(context, input.showcaseId, project?.id ?? null, finished, warnings);
     showcase = added.summary;
     for (const video of finished) {
       const record = records.get(video.video.file.fingerprint);
@@ -474,6 +491,7 @@ export async function uploadVideos(input: UploadVideosInput, context: MediaUploa
     failed: summarizeFailed(failed),
     rejected: summarizeRejected(rejected),
     photosIgnored,
+    project,
     showcase,
     files: summarizeFileIds(
       planned.flatMap((video) => records.get(video.file.fingerprint) ?? []),
@@ -488,6 +506,7 @@ export async function uploadVideos(input: UploadVideosInput, context: MediaUploa
 async function addToShowcase(
   context: MediaUploadContext,
   showcaseId: string,
+  projectId: string | null,
   videos: readonly (VideoRecord & { video: PlannedVideo })[],
   warnings: string[],
 ): Promise<{ summary: NonNullable<VideoUploadSummary["showcase"]>; itemIdsByVideoId: Map<string, string> }> {
@@ -498,7 +517,7 @@ async function addToShowcase(
     for (const item of detail?.images ?? []) if (item.video) itemIdsByVideoId.set(item.video.id, item.id);
   };
   for (const batch of chunk(videos, MAX_GALLERY_VIDEOS_PER_REQUEST)) {
-    const body: AddGalleryVideosRequest = { videoIds: batch.map((video) => video.videoId) };
+    const body: AddGalleryVideosRequest = { videoIds: batch.map((video) => video.videoId), ...(projectId !== null && { projectId }) };
     try {
       rememberItems(await client.post<GalleryDetail>(`${showcasePath(showcaseId)}/videos`, body, { signal: context.signal }));
       videosAdded += batch.length;

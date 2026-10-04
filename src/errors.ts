@@ -1,4 +1,4 @@
-import { FEEDBACK_PLAN_REQUIRED_CODE, PUBLIC_API_ERROR_CODES, SHOWCASE_PRIVATE_CODE } from "@dropl/shared";
+import { FEEDBACK_PLAN_REQUIRED_CODE, PROJECT_ERROR_CODES, PUBLIC_API_ERROR_CODES, SHOWCASE_PRIVATE_CODE } from "@dropl/shared";
 import { LOGIN_COMMAND, API_KEY_ENV } from "./config.js";
 
 export const NETWORK_ERROR_CODE = "NETWORK_ERROR";
@@ -32,8 +32,21 @@ const HINTS_BY_CODE: Record<string, string> = {
   [PUBLIC_API_ERROR_CODES.siteRestrictedKey]: "This key is limited to specific client sites. Ask the user to pick one of the sites from list_sites, or to use a key with access to every site.",
   SUBSCRIPTION_REQUIRED: "The account needs an active plan. Ask the user to check Billing in the Dropl dashboard.",
   GALLERY_FULL: "Create another showcase for the remaining items.",
-  SCHEMA_CHANGED: "Someone changed this collection since you read it. Run get_collection_schema again, rebuild the plan from the current fields, and show the new diff to the user. Never undo their edits.",
-  CONFIRMATION_REQUIRED: "This change loses data or renames something websites rely on. Show the diff to the user and only retry with confirmDestructive: true after they explicitly agree.",
+  [PROJECT_ERROR_CODES.schemaChanged]:
+    "Someone changed these fields since you read them. Read them again (get_collection_schema for a collection, get_project_details for project details), rebuild the change from the current fields, and show the new diff to the user. Never undo their edits.",
+  [PROJECT_ERROR_CODES.confirmationRequired]:
+    "This change loses data (values items or projects have) or renames something websites rely on. Show the diff to the user and only retry with confirmDestructive: true after they explicitly agree.",
+  [PROJECT_ERROR_CODES.projectRequired]:
+    "This is a projects showcase: every photo and video belongs to a project. Pass project (slug, title, or id from list_projects), or create the project first with create_project.",
+  [PROJECT_ERROR_CODES.notProjectsShowcase]: "This is a gallery showcase; leave out project. Projects need a showcase created with type: \"projects\".",
+  [PROJECT_ERROR_CODES.projectNotFound]: "That project isn't in this showcase (it may have been deleted in the dashboard). Run list_projects for the current projects.",
+  [PROJECT_ERROR_CODES.tooManyProjects]: "This showcase holds the maximum number of projects. Tell the user; split the portfolio across several projects showcases only if they agree.",
+  [PROJECT_ERROR_CODES.projectSlugTaken]:
+    "Another project in this showcase uses that slug. Pick a different slug, or update the existing project (list_projects) instead of creating a duplicate.",
+  [PROJECT_ERROR_CODES.showcaseNotEmpty]:
+    "A showcase's type can only change while it has no items and no projects. Create a new showcase with the type you need instead.",
+  [PROJECT_ERROR_CODES.invalidDetails]:
+    "Check the details against get_project_details: values use each detail's key and type (numbers as numbers, select as an option value, dates as YYYY-MM-DD, links as https URLs); definitions keep existing keys and option values exactly.",
   ITEM_LIMIT_REACHED: "The account is out of collection items on its plan. Tell the user; they can upgrade or buy an item add-on under Billing.",
   COLLECTION_FULL: "This collection holds its maximum number of items. Tell the user; don't split it on your own.",
   COLLECTION_LIMIT_REACHED: "The site has as many collections as its plan allows. Tell the user, or reuse an existing collection.",

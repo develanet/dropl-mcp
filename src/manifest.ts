@@ -14,6 +14,8 @@ export interface PhotoManifestEntry {
   path: string;
   imageId: string;
   status: PhotoUploadStatus;
+  /** Projects showcases: the project the photo was uploaded into. */
+  projectId?: string;
   updatedAt: string;
 }
 
@@ -46,6 +48,14 @@ export function manifestPath(configDirectory: string, name: string): string {
 
 export function photoManifestName(showcaseId: string): string {
   return showcaseId;
+}
+
+/**
+ * Gallery uploads keep the bare fingerprint (what earlier versions wrote); a project's uploads are keyed by
+ * project too, so the same file uploaded into two projects is two entries.
+ */
+export function photoManifestKey(fingerprint: string, projectId: string | null): string {
+  return projectId === null ? fingerprint : createHash("sha256").update(`${projectId}\n${fingerprint}`).digest("hex");
 }
 
 export function videoManifestName(siteId: string): string {

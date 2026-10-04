@@ -180,7 +180,7 @@ describe("upload_photos", () => {
       "work/cover.jpg": uniqueJpeg(4),
     });
     const showcase = api.addShowcase("site1", {
-      categories: [{ id: "existing-kitchens", name: "kitchens", slug: "kitchens", position: 0, itemCount: 0 }],
+      categories: [{ id: "existing-kitchens", name: "kitchens", slug: "kitchens", position: 0, itemCount: 0, projectCount: 0 }],
     });
 
     const summary = await uploadPhotos(
