@@ -6,6 +6,8 @@ export const API_URL_ENV = "DROPL_API_URL";
 export const API_KEY_ENV = "DROPL_API_KEY";
 export const LOGIN_COMMAND = "npx -y @dropl/mcp login";
 const CONFIG_DIRECTORY_NAME = "dropl";
+/** MCPB hosts (Claude Desktop) pass `${user_config.api_key}` through verbatim when an optional field is left blank. */
+const UNSUBSTITUTED_PLACEHOLDER_PATTERN = /^\$\{[^}]*\}$/;
 /** WHATWG `URL.hostname` keeps the brackets around IPv6 literals. */
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
@@ -42,6 +44,13 @@ export function normalizeApiUrl(rawUrl: string): string {
   if (url.username || url.password) throw new ConfigError("The Dropl API URL must not contain a username or password.");
   if (url.search || url.hash) throw new ConfigError("The Dropl API URL must not contain a query string or fragment.");
   return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+}
+
+/** The `DROPL_API_KEY` value, or undefined when it's unset, blank, or an unfilled bundle placeholder. */
+export function environmentApiKey(env: NodeJS.ProcessEnv): string | undefined {
+  const value = env[API_KEY_ENV]?.trim();
+  if (!value || UNSUBSTITUTED_PLACEHOLDER_PATTERN.test(value)) return undefined;
+  return value;
 }
 
 export function resolveApiUrl(env: NodeJS.ProcessEnv, override?: string): string {

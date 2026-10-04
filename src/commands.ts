@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import type { PublicApiMeResponse } from "@dropl/shared";
 import { DroplApiClient } from "./api-client.js";
 import { openBrowser as defaultOpenBrowser } from "./browser.js";
-import { API_KEY_ENV, configDirectory, resolveApiUrl, type PlatformContext } from "./config.js";
+import { API_KEY_ENV, configDirectory, environmentApiKey, resolveApiUrl, type PlatformContext } from "./config.js";
 import { credentialsPath, displayKeyPrefix, removeProfile, resolveCredentials, saveProfile } from "./credentials.js";
 import { DEFAULT_CLIENT_NAME, runDeviceLogin } from "./device-login.js";
 import { describeError } from "./errors.js";
@@ -121,7 +121,7 @@ async function login(environment: CliEnvironment, apiUrl: string, filePath: stri
   environment.stdout("");
   environment.stdout(`Connected to ${token.organization.name} as ${token.api_key.name} (${displayKeyPrefix(token.access_token)}).`);
   environment.stdout(`Saved to ${filePath} (readable only by you).`);
-  if (environment.platform.env[API_KEY_ENV]?.trim()) {
+  if (environmentApiKey(environment.platform.env)) {
     environment.stdout(`Note: ${API_KEY_ENV} is set and takes precedence over this sign-in.`);
   }
   return EXIT_OK;
@@ -135,7 +135,7 @@ async function logout(environment: CliEnvironment, apiUrl: string, filePath: str
     environment.stdout(`Removed the saved key ${displayKeyPrefix(removed.apiKey)} ("${removed.keyName}", ${removed.organization.name}) from this computer.`);
     environment.stdout("The key still works until it's revoked: revoke it in Dropl → Settings → API keys.");
   }
-  if (environment.platform.env[API_KEY_ENV]?.trim()) environment.stdout(`${API_KEY_ENV} is still set in this environment.`);
+  if (environmentApiKey(environment.platform.env)) environment.stdout(`${API_KEY_ENV} is still set in this environment.`);
   return EXIT_OK;
 }
 

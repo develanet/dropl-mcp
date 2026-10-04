@@ -106,6 +106,12 @@ describe("credentials file", () => {
     expect(fromFile).toMatchObject({ source: "file", apiKey: ISSUED_API_KEY });
   });
 
+  it.each(["", "   ", "${user_config.api_key}"])("falls back to the stored profile when DROPL_API_KEY is %j (blank bundle setting)", async (blankValue) => {
+    await saveProfile(filePath, LOCAL_API_URL, profile);
+    const resolved = await resolveCredentials({ env: { DROPL_API_KEY: blankValue }, apiUrl: LOCAL_API_URL, credentialsFilePath: filePath });
+    expect(resolved).toMatchObject({ source: "file", apiKey: ISSUED_API_KEY });
+  });
+
   it("explains how to sign in when there are no credentials, without suggesting pasting the key", async () => {
     const error = await resolveCredentials({ env: {}, apiUrl: LOCAL_API_URL, credentialsFilePath: filePath }).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(CredentialsError);

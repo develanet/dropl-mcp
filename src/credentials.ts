@@ -1,7 +1,7 @@
 import { readFile, lstat } from "node:fs/promises";
 import path from "node:path";
 import { API_KEY_DISPLAY_PREFIX_LENGTH, API_KEY_PATTERN } from "@dropl/shared";
-import { API_KEY_ENV, LOGIN_COMMAND } from "./config.js";
+import { API_KEY_ENV, environmentApiKey, LOGIN_COMMAND } from "./config.js";
 import { GROUP_OR_WORLD_ACCESS_MASK, isNodeError, writeFileAtomic } from "./fs-utils.js";
 
 const CREDENTIALS_FILE_NAME = "credentials.json";
@@ -138,7 +138,7 @@ export interface ResolveCredentialsOptions {
 
 /** `DROPL_API_KEY` wins over the stored profile for this API URL. */
 export async function resolveCredentials(options: ResolveCredentialsOptions): Promise<ResolvedCredentials> {
-  const environmentKey = options.env[API_KEY_ENV]?.trim();
+  const environmentKey = environmentApiKey(options.env);
   if (environmentKey) {
     if (!API_KEY_PATTERN.test(environmentKey)) {
       throw new CredentialsError(
