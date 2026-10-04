@@ -8,13 +8,13 @@
     "url": "https://github.com/develanet/dropl-mcp",
     "source": "github"
   },
-  "version": "0.6.0",
+  "version": "0.7.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@dropl/mcp",
-      "version": "0.6.0",
+      "version": "0.7.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"

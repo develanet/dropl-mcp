@@ -3,7 +3,7 @@
   "manifest_version": "0.3",
   "name": "dropl",
   "display_name": "Dropl",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Create client-editable photo and video galleries from Cursor or Claude Code, then embed them.",
   "long_description": "Dropl MCP lets AI coding agents set up Dropl for client websites: create client sites and showcases (embeddable photo and video galleries), upload whole folders of media with categories, fetch embed code for HTML, Next.js, WordPress, Webflow, and Framer, manage collections like menus, inventory, and events, and work through client feedback by fixing it in code, replying, and marking it done. Clients then update their own photos and videos from a phone, without a CMS.",
   "author": {
