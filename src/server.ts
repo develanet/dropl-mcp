@@ -4,12 +4,14 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { CallToolResult, ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
+  ALT_TEXT_GUIDANCE,
   COLLECTION_EDIT_RULES,
   COLLECTION_TOOL_DESCRIPTIONS,
   CollectionToolError,
   GALLERY_CATEGORY_NAME_MAX_LENGTH,
   GALLERY_CATEGORY_SLUG_MAX_LENGTH,
   GALLERY_CATEGORY_SLUG_PATTERN,
+  GALLERY_IMAGE_ALT_MAX_LENGTH,
   GALLERY_LIST_MAX_LIMIT,
   GALLERY_PAGE_SIZE_MAX,
   GALLERY_PAGE_SIZE_MIN,
@@ -80,10 +82,18 @@ import { uploadPhotos } from "./photo-upload.js";
 import { sleep as defaultSleep, type Random, type Sleep } from "./retry.js";
 import { putToStorage, type StoragePut } from "./storage-put.js";
 import type { MediaUploadContext, ProgressReporter } from "./upload-common.js";
-import { PACKAGE_VERSION } from "./version.js";
+import {
+  LIST_ITEMS_DEFAULT_LIMIT,
+  LIST_ITEMS_MAX_LIMIT,
+  listItemsResult,
+  localPathsByItemId,
+  resolveItemIds,
+  updateShowcaseItems,
+} from "./showcase-items.js";
+import { SERVER_TITLE, SHORT_DESCRIPTION, WEBSITE_URL } from "./metadata.js";
+import { PACKAGE_NAME, PACKAGE_VERSION } from "./version.js";
 import { uploadVideos } from "./video-upload.js";
 
-const SERVER_NAME = "dropl";
 const MAX_LISTED_FAILED_ITEMS = 10;
 /** Progress notifications are throttled so a big upload doesn't flood the client. */
 const PROGRESS_MIN_INTERVAL_MS = 250;
@@ -92,11 +102,13 @@ const PATH_MAX_LENGTH = 4096;
 const MAX_PATHS_PER_CALL = 1000;
 const MAX_ITEM_IDS_PER_CALL = 1000;
 const MAX_CATEGORIES_PER_CALL = 50;
+const MAX_ITEM_UPDATES_PER_CALL = 1000;
+const LIST_SEARCH_MAX_LENGTH = 200;
 const PERCENT = 100;
 /** plan_migration works offline, so its optional storage lookup must not hold it up. */
 const USAGE_PROBE_TIMEOUT_MS = 5_000;
 
-export const SERVER_INSTRUCTIONS = `Dropl hosts photo/video showcases and videos that web studios embed on their clients' websites. These tools create client sites and showcases in the user's Dropl account, upload local photos and videos, and return embed code.
+export const SERVER_INSTRUCTIONS = `Dropl hosts client-editable photo and video galleries (showcases), videos, and collections that web studios embed on their clients' websites; clients then update them from the Dropl dashboard or their phone, without a CMS. These tools set that up from the user's codebase: create client sites and showcases, upload local photos and videos, fetch embed code, manage collections, and work through client feedback. Typical flow: whoami, then list_sites (or create_site), create_showcase, upload_photos, and get_embed_code, then paste the embed and build. Before creating or uploading anything, show the user the plan and wait for their explicit confirmation.
 
 Rules:
 - Before creating a site or showcase or uploading anything, run plan_migration (or upload_photos / upload_videos with dryRun: true), show the plan to the user (client site, showcase title, categories, file counts and sizes) and get their explicit confirmation. Don't create or upload on your own initiative.
@@ -104,6 +116,8 @@ Rules:
 - Never ask the user to paste an API key into the chat. If a tool says you're not signed in, ask the user to run \`${LOGIN_COMMAND}\` in their own terminal (or set DROPL_API_KEY in this server's MCP config), then try again.
 - Pass absolute paths (or set cwd to the project folder) for uploads.
 - Uploads are resumable and idempotent: if one stops partway, run the same call again; finished files are skipped.
+- Uploads return each file's id (files[].id); use those ids with update_items or tag_items instead of re-uploading. list_showcase_items pages through every item with its local path, alt text, and categories.
+- Alt text: ${ALT_TEXT_GUIDANCE} Set it per photo with upload_photos files[].alt, or later with update_items.
 - Use get_embed_code for embed snippets; never write embed HTML by hand.
 - After adding an embed to the user's project, run the project's build (or type check) to make sure it still compiles.
 
@@ -122,6 +136,8 @@ Feedback (requests clients leave on their website). To fix the open Dropl feedba
 5. ${FEEDBACK_TOOL_GUIDANCE.markDone}
 Tell the user which requests you fixed, which you asked about, and which you skipped.`;
 
+const COLLECTIONS_PLAN_DESCRIPTION =
+  "Collections to create or change, e.g. [{ \"name\": \"Menu\", \"fields\": [{ \"label\": \"Name\", \"type\": \"text\" }, { \"label\": \"Price\", \"type\": \"price\", \"currency\": \"USD\" }] }].";
 const CONFIRM_FIRST = "Only call after showing the plan to the user and getting explicit confirmation.";
 
 export interface ServerDependencies {
@@ -162,18 +178,26 @@ function progressReporter(extra: ToolExtra, now: () => number): ProgressReporter
   };
 }
 
-const idSchema = (description: string) => z.string().trim().min(1).max(ID_MAX_LENGTH).describe(description);
+/** Shown in parameter descriptions; real ids are UUIDs like this one. */
+const EXAMPLE_ID = "0190f5c2-7b1e-7c3a-9d2f-1a2b3c4d5e6f";
+const withExample = (description: string, example: string) => `${description.replace(/\.$/, "")}, e.g. ${example}.`;
+const idSchema = (description: string) => z.string().trim().min(1).max(ID_MAX_LENGTH).describe(withExample(description, `"${EXAMPLE_ID}"`));
+const idListSchema = (description: string, maxItems: number) =>
+  z.array(z.string().min(1).max(ID_MAX_LENGTH)).max(maxItems).describe(withExample(description, `["${EXAMPLE_ID}"]`));
 const pathsSchema = z
   .array(z.string().min(1).max(PATH_MAX_LENGTH))
   .min(1)
   .max(MAX_PATHS_PER_CALL)
-  .describe("Files, folders, or glob patterns (e.g. /abs/photos/**/*.jpg). Prefer absolute paths; relative ones resolve against cwd.");
-const cwdSchema = z.string().max(PATH_MAX_LENGTH).optional().describe("Absolute path of the user's project folder; relative paths resolve against it.");
+  .describe("Files, folders, or glob patterns, e.g. [\"/abs/photos/**/*.jpg\"]. Prefer absolute paths; relative ones resolve against cwd.");
+const cwdSchema = z.string().max(PATH_MAX_LENGTH).optional().describe("Absolute path of the user's project folder; relative paths resolve against it, e.g. \"/Users/ana/sites/acme\".");
+const recursiveSchema = z.boolean().optional().describe("Include subfolders (default true), e.g. false to upload only the top folder.");
+const dryRunSchema = z.boolean().optional().describe("Only check the files and report what would be uploaded, e.g. true for the first call.");
 const categoryNamesSchema = z
   .array(z.string().min(1).max(GALLERY_CATEGORY_NAME_MAX_LENGTH))
   .max(MAX_CATEGORIES_PER_CALL);
-const layoutSchema = z.enum(["grid", "collage"]).optional().describe("grid (even tiles) or collage (masonry).");
-const gridFitSchema = z.enum(["cover", "contain"]).optional().describe("cover crops grid tiles; contain letterboxes them to show the whole item.");
+const layoutSchema = z.enum(["grid", "collage"]).optional().describe("grid (even tiles) or collage (masonry), e.g. \"grid\".");
+const gridFitSchema = z.enum(["cover", "contain"]).optional().describe("cover crops grid tiles; contain letterboxes them to show the whole item, e.g. \"cover\".");
+const showCategoryFiltersSchema = z.boolean().optional().describe("Show category filter tabs above the items, e.g. true when items are grouped into categories.");
 const pageSizeSchema = z
   .number()
   .int()
@@ -181,7 +205,7 @@ const pageSizeSchema = z
   .max(GALLERY_PAGE_SIZE_MAX)
   .nullable()
   .optional()
-  .describe(`Items per "Load more" page (${GALLERY_PAGE_SIZE_MIN}–${GALLERY_PAGE_SIZE_MAX}), or null to show everything.`);
+  .describe(`Items per "Load more" page (${GALLERY_PAGE_SIZE_MIN}–${GALLERY_PAGE_SIZE_MAX}), or null to show everything, e.g. 12.`);
 
 /** Accepts `example.com` or a pasted URL like `https://www.example.com/`; returns the bare hostname. */
 export function normalizeSiteDomain(input: string): string {
@@ -225,6 +249,7 @@ export function summarizeShowcase(detail: GalleryDetail) {
     videoAvailability,
     categories: detail.categories.map((category) => ({ id: category.id, name: category.name, slug: category.slug, itemCount: category.itemCount })),
     uncategorized,
+    photosWithoutAltText: detail.images.filter((item) => item.kind === "photo" && !item.altText).length,
     failedItems: failedItems.items,
     failedItemsOmitted: failedItems.omitted,
     updatedAt: detail.updatedAt,
@@ -301,14 +326,18 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     }
   }
 
-  const server = new McpServer({ name: SERVER_NAME, version: PACKAGE_VERSION }, { instructions: SERVER_INSTRUCTIONS });
+  const server = new McpServer(
+    { name: PACKAGE_NAME, title: SERVER_TITLE, version: PACKAGE_VERSION, description: SHORT_DESCRIPTION, websiteUrl: WEBSITE_URL },
+    { instructions: SERVER_INSTRUCTIONS },
+  );
 
   server.registerTool(
     "whoami",
     {
       title: "Who am I",
-      description: "Shows the connected Dropl account, user, role, API key (name, prefix, scopes, site restriction) and web app URL. Use it to check the connection.",
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      description:
+        "Shows the connected Dropl account, user, role, and API key (name, prefix, scopes, site restriction) plus the web app URL. Use it first in a session to confirm which account you're acting on, or when another tool reports a sign-in or permission error. Needs a saved sign-in or DROPL_API_KEY; it never returns the full key.",
+      annotations: { title: "Who am I", readOnlyHint: true, openWorldHint: false },
     },
     () =>
       run("whoami", async () => {
@@ -336,8 +365,9 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "list_sites",
     {
       title: "List client sites",
-      description: "Lists the client sites (websites) this key can reach, with their domains and the plan's site allowance.",
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      description:
+        "Lists the client sites (one per client website) this connection can reach, with their domains and the plan's site allowance. Use it before creating anything, to find the site id for the client the user means and avoid duplicate sites. Keys restricted to some sites only see those sites.",
+      annotations: { title: "List client sites", readOnlyHint: true, openWorldHint: false },
     },
     () =>
       run("list_sites", async () => {
@@ -351,12 +381,12 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "create_site",
     {
       title: "Create client site",
-      description: `Creates a client site (one per client website). Check list_sites first to avoid duplicates. ${CONFIRM_FIRST} Safe to retry: the same name and domain return the same site.`,
+      description: `Creates a client site: the home for one client website's showcases, videos, collections, and feedback. Use it when the client has no site yet; check list_sites first to avoid duplicates. ${CONFIRM_FIRST} Counts toward the plan's site allowance; safe to retry, since the same name and domain return the same site.`,
       inputSchema: {
         name: z.string().trim().min(1).max(WORKSPACE_NAME_MAX_LENGTH).describe("Client or website name, e.g. \"Acme Builders\"."),
-        domain: z.string().trim().min(1).max(SITE_DOMAIN_MAX_LENGTH).optional().describe("The website's hostname, e.g. acme.com."),
+        domain: z.string().trim().min(1).max(SITE_DOMAIN_MAX_LENGTH).optional().describe("The website's hostname, e.g. \"acme.com\" (a pasted URL like https://www.acme.com/ also works)."),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Create client site", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     ({ name, domain }) =>
       run("create_site", async () => {
@@ -372,13 +402,14 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "list_showcases",
     {
       title: "List showcases",
-      description: "Lists a client site's showcases (photo/video galleries), newest first.",
+      description:
+        "Lists a client site's showcases (embeddable photo and video galleries), newest first, with item counts. Use it to reuse an existing gallery instead of creating a duplicate, or to find a showcase id. Paged: pass nextCursor to get more.",
       inputSchema: {
         siteId: idSchema("Client site id from list_sites."),
-        cursor: z.string().max(ID_MAX_LENGTH).optional().describe("nextCursor from a previous call."),
-        limit: z.number().int().min(1).max(GALLERY_LIST_MAX_LIMIT).optional(),
+        cursor: z.string().max(ID_MAX_LENGTH).optional().describe("nextCursor from a previous call, e.g. \"eyJpZCI6IjAxOTAifQ\"."),
+        limit: z.number().int().min(1).max(GALLERY_LIST_MAX_LIMIT).optional().describe(`Showcases per page (1–${GALLERY_LIST_MAX_LIMIT}), e.g. 20.`),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { title: "List showcases", readOnlyHint: true, openWorldHint: false },
     },
     ({ siteId, cursor, limit }) =>
       run("list_showcases", async () => {
@@ -404,16 +435,16 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "create_showcase",
     {
       title: "Create showcase",
-      description: `Creates a showcase (an embeddable photo/video gallery) in a client site. ${CONFIRM_FIRST} Turn on showCategoryFilters when items will be grouped into categories. Safe to retry with the same arguments.`,
+      description: `Creates a showcase: an embeddable photo/video gallery the client can update from their phone. Use it when the user wants a gallery, portfolio, project photos, or a section the client can update themselves. Requires a site id from list_sites or create_site. ${CONFIRM_FIRST} Turn on showCategoryFilters when items will be grouped into categories. Safe to retry with the same arguments.`,
       inputSchema: {
         siteId: idSchema("Client site id from list_sites or create_site."),
-        title: z.string().trim().min(1).max(GALLERY_TITLE_MAX_LENGTH),
+        title: z.string().trim().min(1).max(GALLERY_TITLE_MAX_LENGTH).describe("Gallery title, e.g. \"Our work\"."),
         layout: layoutSchema,
         gridFit: gridFitSchema,
-        showCategoryFilters: z.boolean().optional().describe("Show category filter tabs above the items."),
+        showCategoryFilters: showCategoryFiltersSchema,
         pageSize: pageSizeSchema,
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Create showcase", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     ({ siteId, ...settings }) =>
       run("create_showcase", async () => {
@@ -431,9 +462,10 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "get_showcase",
     {
       title: "Get showcase",
-      description: "Summarizes a showcase: settings, item counts by status (processing/ready/failed) and kind, categories with counts, and failed items.",
-      inputSchema: { showcaseId: idSchema("Showcase id.") },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      description:
+        "Summarizes a showcase: settings, item counts by status (processing/ready/failed) and kind, categories with counts, photos without alt text, and failed items. Use it to check that an upload finished processing or to review a gallery before changing it. It returns counts, not items: use list_showcase_items for ids, alt text, and categories.",
+      inputSchema: { showcaseId: idSchema("Showcase id from list_showcases or create_showcase.") },
+      annotations: { title: "Get showcase", readOnlyHint: true, openWorldHint: false },
     },
     ({ showcaseId }) =>
       run("get_showcase", async () => {
@@ -443,19 +475,81 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
   );
 
   server.registerTool(
+    "list_showcase_items",
+    {
+      title: "List showcase items",
+      description: `Pages through a showcase's items in display order: id, kind, status, file name, the local path it was uploaded from, alt text, and categories. Use it to find item ids for update_items or tag_items, or photos that still need alt text (missingAlt: true). Up to ${LIST_ITEMS_MAX_LIMIT} items per call; local paths only appear for files uploaded from this machine.`,
+      inputSchema: {
+        showcaseId: idSchema("Showcase id from list_showcases."),
+        kind: z.enum(["photo", "video"]).optional().describe("Only photos or only videos, e.g. \"photo\"."),
+        missingAlt: z.boolean().optional().describe("Only photos without alt text, e.g. true."),
+        category: z.string().max(GALLERY_CATEGORY_SLUG_MAX_LENGTH).optional().describe("Only items in this category (name, slug, or id), e.g. \"Kitchens\"."),
+        search: z.string().trim().max(LIST_SEARCH_MAX_LENGTH).optional().describe("Case-insensitive text in the file name, local path, or alt text, e.g. \"deck\"."),
+        offset: z.number().int().min(0).optional().describe("nextOffset from a previous call, e.g. 50."),
+        limit: z.number().int().min(1).max(LIST_ITEMS_MAX_LIMIT).optional().describe(`Items per page (default ${LIST_ITEMS_DEFAULT_LIMIT}), e.g. 100.`),
+      },
+      annotations: { title: "List showcase items", readOnlyHint: true, openWorldHint: false },
+    },
+    ({ showcaseId, ...filters }) =>
+      run("list_showcase_items", async () => {
+        const { client } = await connect();
+        const detail = await client.get<GalleryDetail>(showcasePath(showcaseId));
+        return listItemsResult(detail, await localPathsByItemId(client, configDir, detail, dependencies.log), filters);
+      }),
+  );
+
+  server.registerTool(
+    "update_items",
+    {
+      title: "Update showcase items",
+      description: `Sets alt text and adds/removes categories on many showcase items in one call. Use it after an upload to fix alt text or categories by id (files[].id from upload_photos / upload_videos, library video ids, or ids from list_showcase_items) instead of uploading again. Up to ${MAX_ITEM_UPDATES_PER_CALL} items per call; category names that don't exist yet are created. Alt text: ${ALT_TEXT_GUIDANCE} Show the user the alt text you plan to write before saving a large batch.`,
+      inputSchema: {
+        showcaseId: idSchema("Showcase id from list_showcases."),
+        items: z
+          .array(
+            z.object({
+              id: z.string().min(1).max(ID_MAX_LENGTH).describe(withExample("Item id (or a library video id in this showcase)", `"${EXAMPLE_ID}"`)),
+              alt: z
+                .string()
+                .max(GALLERY_IMAGE_ALT_MAX_LENGTH)
+                .nullable()
+                .optional()
+                .describe("New alt text, e.g. \"Cedar deck with glass railing at dusk\"; empty or null clears it (decorative photo). Omit to leave it unchanged."),
+              addCategories: categoryNamesSchema.optional().describe("Category names, slugs, or ids to add, e.g. [\"Decks\"]."),
+              removeCategories: categoryNamesSchema.optional().describe("Category names, slugs, or ids to remove, e.g. [\"Uncategorized\"]."),
+            }),
+          )
+          .min(1)
+          .max(MAX_ITEM_UPDATES_PER_CALL)
+          .describe("Changes per item, e.g. [{ \"id\": \"…\", \"alt\": \"Stone patio with fire pit\", \"addCategories\": [\"Patios\"] }]."),
+      },
+      annotations: { title: "Update showcase items", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    ({ showcaseId, items }) =>
+      run("update_items", async () => {
+        if (items.every((item) => item.alt === undefined && !item.addCategories?.length && !item.removeCategories?.length)) {
+          throw new UserFacingError("Nothing to change: pass alt, addCategories, or removeCategories for at least one item.");
+        }
+        const { client } = await connect();
+        return updateShowcaseItems(client, showcaseId, items);
+      }),
+  );
+
+  server.registerTool(
     "update_showcase",
     {
       title: "Update showcase settings",
-      description: "Changes a showcase's title, layout, grid fit, category filter tabs, or page size.",
+      description:
+        "Changes a showcase's title, layout, grid fit, category filter tabs, or items per page. Use it when the user wants the gallery to look or page differently; embeds pick up the change without new code. Pass only the settings to change; at least one is required.",
       inputSchema: {
-        showcaseId: idSchema("Showcase id."),
-        title: z.string().trim().min(1).max(GALLERY_TITLE_MAX_LENGTH).optional(),
+        showcaseId: idSchema("Showcase id from list_showcases."),
+        title: z.string().trim().min(1).max(GALLERY_TITLE_MAX_LENGTH).optional().describe("New gallery title, e.g. \"Recent projects\"."),
         layout: layoutSchema,
         gridFit: gridFitSchema,
-        showCategoryFilters: z.boolean().optional(),
+        showCategoryFilters: showCategoryFiltersSchema,
         pageSize: pageSizeSchema,
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Update showcase settings", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     ({ showcaseId, ...changes }) =>
       run("update_showcase", async () => {
@@ -470,13 +564,19 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "create_category",
     {
       title: "Create category",
-      description: "Adds a category (filter tab) to a showcase. If one with the same name or slug exists, it's returned instead of creating a duplicate.",
+      description:
+        "Adds a category (a filter tab) to a showcase. Use it to group items, e.g. one category per project type or source folder, before tagging them; upload and tagging tools also create missing categories by name. If one with the same name or slug exists, it's returned instead of creating a duplicate.",
       inputSchema: {
-        showcaseId: idSchema("Showcase id."),
-        name: z.string().trim().min(1).max(GALLERY_CATEGORY_NAME_MAX_LENGTH),
-        slug: z.string().regex(GALLERY_CATEGORY_SLUG_PATTERN).max(GALLERY_CATEGORY_SLUG_MAX_LENGTH).optional().describe("URL form, e.g. kitchen-remodels; derived from the name if omitted."),
+        showcaseId: idSchema("Showcase id from list_showcases."),
+        name: z.string().trim().min(1).max(GALLERY_CATEGORY_NAME_MAX_LENGTH).describe("Tab label, e.g. \"Kitchen remodels\"."),
+        slug: z
+          .string()
+          .regex(GALLERY_CATEGORY_SLUG_PATTERN)
+          .max(GALLERY_CATEGORY_SLUG_MAX_LENGTH)
+          .optional()
+          .describe("URL form, e.g. \"kitchen-remodels\"; derived from the name if omitted."),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Create category", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     ({ showcaseId, name, slug }) =>
       run("create_category", async () => {
@@ -502,35 +602,40 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "tag_items",
     {
       title: "Tag showcase items",
-      description: "Adds and/or removes categories on showcase items (photos or videos; item ids come from get_showcase or upload results). Category names that don't exist yet are created.",
+      description: `Adds and/or removes the same categories on many showcase items (photos or videos) at once. Use it to put uploaded items into filter tabs, with itemIds from upload_photos / upload_videos (files[].id; library video ids work too) or list_showcase_items. Up to ${MAX_ITEM_IDS_PER_CALL} items per call; category names that don't exist yet are created. For per-item changes or alt text, use update_items.`,
       inputSchema: {
-        showcaseId: idSchema("Showcase id."),
-        itemIds: z.array(z.string().min(1).max(ID_MAX_LENGTH)).min(1).max(MAX_ITEM_IDS_PER_CALL),
-        addCategoryIds: z.array(z.string().min(1).max(ID_MAX_LENGTH)).max(MAX_CATEGORIES_PER_CALL).optional(),
-        addCategoryNames: categoryNamesSchema.optional(),
-        removeCategoryIds: z.array(z.string().min(1).max(ID_MAX_LENGTH)).max(MAX_CATEGORIES_PER_CALL).optional(),
+        showcaseId: idSchema("Showcase id from list_showcases."),
+        itemIds: z
+          .array(z.string().min(1).max(ID_MAX_LENGTH))
+          .min(1)
+          .max(MAX_ITEM_IDS_PER_CALL)
+          .describe(withExample("Item ids (files[].id from uploads, or from list_showcase_items)", `["${EXAMPLE_ID}"]`)),
+        addCategoryIds: idListSchema("Existing category ids to add", MAX_CATEGORIES_PER_CALL).optional(),
+        addCategoryNames: categoryNamesSchema.optional().describe("Category names to add, created if missing, e.g. [\"Decks\", \"Patios\"]."),
+        removeCategoryIds: idListSchema("Category ids to remove", MAX_CATEGORIES_PER_CALL).optional(),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Tag showcase items", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     ({ showcaseId, itemIds, addCategoryIds, addCategoryNames, removeCategoryIds }) =>
       run("tag_items", async () => {
         const { client } = await connect();
         const addIds = new Set(addCategoryIds ?? []);
         const names = (addCategoryNames ?? []).map(normalizeCategoryName).filter((name): name is string => name !== null);
+        const showcase = await client.get<GalleryDetail>(showcasePath(showcaseId));
+        const uniqueItemIds = [...new Set(resolveItemIds(showcase, itemIds))];
         let createdCategories: string[] = [];
         if (names.length > 0) {
-          const showcase = await client.get<GalleryDetail>(showcasePath(showcaseId));
           const resolved = await ensureCategories(client, showcaseId, names, showcase.categories);
           for (const category of resolved.values()) addIds.add(category.id);
           createdCategories = [...resolved.values()].filter((category) => category.created).map((category) => category.name);
         }
         const removeIds = removeCategoryIds ?? [];
         if (addIds.size === 0 && removeIds.length === 0) throw new UserFacingError("Pass categories to add or remove.");
-        await bulkTagItems(client, showcaseId, [...new Set(itemIds)], {
+        await bulkTagItems(client, showcaseId, uniqueItemIds, {
           ...(addIds.size > 0 ? { addCategoryIds: [...addIds] } : {}),
           ...(removeIds.length > 0 ? { removeCategoryIds: removeIds } : {}),
         });
-        return { tagged: new Set(itemIds).size, addedCategoryIds: [...addIds], removedCategoryIds: removeIds, createdCategories };
+        return { tagged: uniqueItemIds.length, addedCategoryIds: [...addIds], removedCategoryIds: removeIds, createdCategories };
       }),
   );
 
@@ -538,17 +643,40 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "upload_photos",
     {
       title: "Upload photos",
-      description: `Uploads local photos (JPEG, PNG, WebP, AVIF, HEIC; up to 20 MB each) into a showcase, straight to storage. Accepts files, folders (recursive by default) and globs; skips hidden files and validates file contents. Run with dryRun: true first and show the result to the user; ${CONFIRM_FIRST} Resumable: re-running with the same arguments skips files already uploaded. categoryFromFolder tags each photo with its top-level folder's name; categories tags every photo (both created if missing).`,
+      description: `Uploads local photos (JPEG, PNG, WebP, AVIF, HEIC; up to 20 MB each) into a showcase, straight to storage. Use it to turn a folder of project photos into a client-editable gallery: pass files, folders (recursive by default), and globs via paths, and per-photo alt text and categories via files. Skips hidden files and validates file contents. Run with dryRun: true first and show the result to the user; ${CONFIRM_FIRST} Resumable: re-running with the same arguments skips files already uploaded (and still applies changed alt text and categories). categoryFromFolder tags each photo with its top-level folder's name; categories tags every photo (both created if missing). Returns files: each local path with its showcase item id and status, for update_items and tag_items. Alt text: ${ALT_TEXT_GUIDANCE}`,
       inputSchema: {
         showcaseId: idSchema("Showcase id from create_showcase or list_showcases."),
-        paths: pathsSchema,
+        paths: pathsSchema
+          .optional()
+          .describe("Files, folders, or glob patterns, e.g. [\"/abs/photos/**/*.jpg\"]. Prefer absolute paths; relative ones resolve against cwd. Pass paths, files, or both."),
+        files: z
+          .array(
+            z.object({
+              path: z
+                .string()
+                .min(1)
+                .max(PATH_MAX_LENGTH)
+                .describe("A photo file (or a folder/glob, applying the same alt text and categories to each), e.g. \"/abs/photos/deck.jpg\"."),
+              alt: z
+                .string()
+                .max(GALLERY_IMAGE_ALT_MAX_LENGTH)
+                .nullable()
+                .optional()
+                .describe(`Alt text, up to ${GALLERY_IMAGE_ALT_MAX_LENGTH} characters, e.g. "Cedar deck with glass railing at dusk". Empty or null for a purely decorative photo; omit to leave it unchanged.`),
+              categories: categoryNamesSchema.optional().describe("Categories for this photo (created if missing), e.g. [\"Decks\"]."),
+            }),
+          )
+          .min(1)
+          .max(MAX_PATHS_PER_CALL)
+          .optional()
+          .describe("Photos with their own alt text and categories, e.g. [{ \"path\": \"/abs/photos/deck.jpg\", \"alt\": \"Cedar deck at dusk\", \"categories\": [\"Decks\"] }]."),
         cwd: cwdSchema,
-        recursive: z.boolean().optional().describe("Include subfolders (default true)."),
-        categoryFromFolder: z.boolean().optional().describe("Tag photos with their top-level folder name as a category (default false)."),
-        categories: categoryNamesSchema.optional().describe("Category names to tag every uploaded photo with."),
-        dryRun: z.boolean().optional().describe("Only check the files and report what would be uploaded."),
+        recursive: recursiveSchema,
+        categoryFromFolder: z.boolean().optional().describe("Tag photos with their top-level folder name as a category (default false), e.g. true for Kitchens/ and Decks/ folders."),
+        categories: categoryNamesSchema.optional().describe("Category names to tag every uploaded photo with, e.g. [\"Featured\"]."),
+        dryRun: dryRunSchema,
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Upload photos", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     (input, extra) =>
       run("upload_photos", async () => {
@@ -561,14 +689,15 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "list_videos",
     {
       title: "List videos",
-      description: "Lists videos in a client site's library (newest first), optionally filtered by a title search. Use it to find video ids for embeds or showcases.",
+      description:
+        "Lists videos in a client site's library (newest first), optionally filtered by a title search. Use it to find video ids for get_embed_code or add_videos_to_showcase, or to check a video is already hosted before uploading it again. Paged: pass nextCursor for more.",
       inputSchema: {
-        siteId: idSchema("Client site id."),
-        search: z.string().max(GALLERY_TITLE_MAX_LENGTH).optional(),
-        cursor: z.string().max(ID_MAX_LENGTH).optional(),
-        limit: z.number().int().min(1).max(VIDEO_LIST_MAX_LIMIT).optional(),
+        siteId: idSchema("Client site id from list_sites."),
+        search: z.string().max(GALLERY_TITLE_MAX_LENGTH).optional().describe("Text in the video title, e.g. \"hero\"."),
+        cursor: z.string().max(ID_MAX_LENGTH).optional().describe("nextCursor from a previous call, e.g. \"eyJpZCI6IjAxOTAifQ\"."),
+        limit: z.number().int().min(1).max(VIDEO_LIST_MAX_LIMIT).optional().describe(`Videos per page (1–${VIDEO_LIST_MAX_LIMIT}), e.g. 20.`),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { title: "List videos", readOnlyHint: true, openWorldHint: false },
     },
     ({ siteId, search, cursor, limit }) =>
       run("list_videos", async () => {
@@ -593,18 +722,18 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "upload_videos",
     {
       title: "Upload videos",
-      description: `Uploads local videos (MP4, MOV, WebM, MKV, AVI, MPEG, M4V) to a client site's library in resumable parts, titled from their file names. With showcaseId, also adds them to that showcase (and applies categories / categoryFromFolder). Run with dryRun: true first; ${CONFIRM_FIRST} Re-running with the same arguments resumes interrupted uploads and skips finished ones.`,
+      description: `Uploads local videos (MP4, MOV, WebM, MKV, AVI, MPEG, M4V) to a client site's video library in resumable parts, titled from their file names, for streaming playback without YouTube or Vimeo. Use it to host a hero video or a folder of clips; with showcaseId it also adds them to that showcase (and applies categories / categoryFromFolder). Run with dryRun: true first; ${CONFIRM_FIRST} Re-running with the same arguments resumes interrupted uploads and skips finished ones. Returns files: each local path with its library video id.`,
       inputSchema: {
-        siteId: idSchema("Client site id."),
+        siteId: idSchema("Client site id from list_sites."),
         paths: pathsSchema,
         cwd: cwdSchema,
-        recursive: z.boolean().optional().describe("Include subfolders (default true)."),
+        recursive: recursiveSchema,
         showcaseId: idSchema("Showcase (in the same site) to add the videos to.").optional(),
-        categoryFromFolder: z.boolean().optional().describe("With showcaseId: tag each video with its top-level folder name."),
-        categories: categoryNamesSchema.optional().describe("With showcaseId: categories to tag every video with."),
-        dryRun: z.boolean().optional().describe("Only check the files and report what would be uploaded."),
+        categoryFromFolder: z.boolean().optional().describe("With showcaseId: tag each video with its top-level folder name, e.g. true."),
+        categories: categoryNamesSchema.optional().describe("With showcaseId: categories to tag every video with, e.g. [\"Tours\"]."),
+        dryRun: dryRunSchema,
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Upload videos", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     (input, extra) =>
       run("upload_videos", async () => {
@@ -617,12 +746,17 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "add_videos_to_showcase",
     {
       title: "Add videos to showcase",
-      description: "Adds existing library videos (from the showcase's client site) to a showcase. Videos already in it are skipped.",
+      description:
+        "Adds existing library videos to a showcase. Use it for videos already hosted in Dropl (ids from list_videos or upload_videos) instead of uploading them again. Videos must belong to the showcase's client site; ones already in it are skipped.",
       inputSchema: {
-        showcaseId: idSchema("Showcase id."),
-        videoIds: z.array(z.string().min(1).max(ID_MAX_LENGTH)).min(1).max(MAX_ITEM_IDS_PER_CALL),
+        showcaseId: idSchema("Showcase id from list_showcases."),
+        videoIds: z
+          .array(z.string().min(1).max(ID_MAX_LENGTH))
+          .min(1)
+          .max(MAX_ITEM_IDS_PER_CALL)
+          .describe(withExample("Library video ids from list_videos or upload_videos", `["${EXAMPLE_ID}"]`)),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Add videos to showcase", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     ({ showcaseId, videoIds }) =>
       run("add_videos_to_showcase", async () => {
@@ -640,13 +774,18 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "get_embed_code",
     {
       title: "Get embed code",
-      description: "Returns the official embed snippet for a video (videoId) or a showcase (showcaseId, optionally one category by name or slug), plus where and how to paste it (plain HTML, React/Next.js, WordPress, Webflow, Framer). Always use this instead of writing embed HTML by hand.",
+      description:
+        "Returns the official embed snippet for a video (videoId) or a showcase (showcaseId, optionally one category by name or slug), plus where and how to paste it (plain HTML, React/Next.js, WordPress, Webflow, Framer). Use it whenever a gallery or video goes onto a page. Always use this instead of writing embed HTML by hand; pass exactly one of videoId or showcaseId.",
       inputSchema: {
-        videoId: idSchema("Video id.").optional(),
-        showcaseId: idSchema("Showcase id.").optional(),
-        category: z.string().max(GALLERY_CATEGORY_SLUG_MAX_LENGTH).optional().describe("With showcaseId: a category name or slug, to embed only that category without filter tabs."),
+        videoId: idSchema("Video id from list_videos or upload_videos.").optional(),
+        showcaseId: idSchema("Showcase id from list_showcases.").optional(),
+        category: z
+          .string()
+          .max(GALLERY_CATEGORY_SLUG_MAX_LENGTH)
+          .optional()
+          .describe("With showcaseId: a category name or slug, to embed only that category without filter tabs, e.g. \"kitchens\"."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { title: "Get embed code", readOnlyHint: true, openWorldHint: false },
     },
     ({ videoId, showcaseId, category }) =>
       run("get_embed_code", async () => {
@@ -662,8 +801,9 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "get_usage",
     {
       title: "Get usage",
-      description: "Shows storage and bandwidth used against the plan's limits this period, and whether uploads or playback are suspended.",
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      description:
+        "Shows storage and bandwidth used against the plan's limits this period, and whether uploads or playback are suspended. Use it before a large upload, or when the user asks how much space is left. Figures cover the whole account, not one client site.",
+      annotations: { title: "Get usage", readOnlyHint: true, openWorldHint: false },
     },
     () =>
       run("get_usage", async () => {
@@ -676,14 +816,15 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "plan_migration",
     {
       title: "Plan a media migration",
-      description: "Scans a local folder (no upload) and proposes how to bring it into Dropl: top-level folders become categories, photo/video counts and sizes per folder, unsupported files by reason, upload batches, whether it needs several showcases, remaining storage (when signed in) and the tool calls to run. Run this first and show the plan to the user for confirmation.",
+      description:
+        "Scans a local folder without uploading and proposes how to bring it into Dropl: top-level folders become categories, photo/video counts and sizes per folder, unsupported files by reason, upload batches, whether it needs several showcases, remaining storage, and the tool calls to run. Use it first for any folder-to-gallery move or site migration, then show the plan to the user for confirmation. Works offline; remaining storage is only included when signed in.",
       inputSchema: {
-        path: z.string().min(1).max(PATH_MAX_LENGTH).describe("Folder to scan; prefer an absolute path."),
+        path: z.string().min(1).max(PATH_MAX_LENGTH).describe("Folder to scan; prefer an absolute path, e.g. \"/Users/ana/sites/acme/public/projects\"."),
         cwd: cwdSchema,
-        recursive: z.boolean().optional().describe("Include subfolders (default true)."),
-        categoryFromFolder: z.boolean().optional().describe("Turn top-level folders into categories (default true)."),
+        recursive: recursiveSchema,
+        categoryFromFolder: z.boolean().optional().describe("Turn top-level folders into categories (default true), e.g. false for one flat gallery."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: false },
+      annotations: { title: "Plan a media migration", readOnlyHint: true, openWorldHint: false },
     },
     (input) =>
       run("plan_migration", async () => {
@@ -702,12 +843,12 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "list_collections",
     {
       title: "List collections",
-      description: COLLECTION_TOOL_DESCRIPTIONS.list_collections,
+      description: `${COLLECTION_TOOL_DESCRIPTIONS.list_collections} Use it to find a collection id (a menu, inventory, team, or events) before reading or changing one, and to reuse an existing collection instead of creating a duplicate. Trashed collections only appear with trashed: true.`,
       inputSchema: {
         siteId: idSchema("Client site id (from list_sites)."),
-        trashed: z.boolean().optional().describe("List trashed collections instead (restorable for 30 days)."),
+        trashed: z.boolean().optional().describe("List trashed collections instead (restorable for 30 days), e.g. true."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { title: "List collections", readOnlyHint: true, openWorldHint: false },
     },
     ({ siteId, trashed }) =>
       run("list_collections", async () => {
@@ -720,9 +861,9 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "get_collection_schema",
     {
       title: "Get collection schema",
-      description: COLLECTION_TOOL_DESCRIPTIONS.get_collection_schema,
+      description: `${COLLECTION_TOOL_DESCRIPTIONS.get_collection_schema} Use it right before any change to a collection or its items, since clients and teammates edit in the dashboard. It returns the schemaVersion that plan_collections needs to change an existing collection.`,
       inputSchema: { collectionId: idSchema("Collection id (from list_collections).") },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { title: "Get collection schema", readOnlyHint: true, openWorldHint: false },
     },
     ({ collectionId }) =>
       run("get_collection_schema", async () => {
@@ -736,12 +877,12 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "plan_collections",
     {
       title: "Plan collections",
-      description: `${COLLECTION_TOOL_DESCRIPTIONS.plan_collections} Show the summary to the user before apply_collection_plan.`,
+      description: `${COLLECTION_TOOL_DESCRIPTIONS.plan_collections} Use it whenever the user wants content their client can edit (a menu, inventory, events, team) or a field change; nothing is saved. Show the summary to the user before apply_collection_plan.`,
       inputSchema: {
         siteId: idSchema("Client site id (from list_sites)."),
-        collections: collectionPlanSchema,
+        collections: collectionPlanSchema.describe(COLLECTIONS_PLAN_DESCRIPTION),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { title: "Plan collections", readOnlyHint: true, openWorldHint: false },
     },
     ({ siteId, collections }) =>
       run("plan_collections", async () => {
@@ -755,13 +896,13 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "apply_collection_plan",
     {
       title: "Apply collection plan",
-      description: `${COLLECTION_TOOL_DESCRIPTIONS.apply_collection_plan} ${CONFIRM_FIRST}`,
+      description: `${COLLECTION_TOOL_DESCRIPTIONS.apply_collection_plan} Use it with exactly the collections you passed to plan_collections, once the user approved that plan. ${CONFIRM_FIRST}`,
       inputSchema: {
         siteId: idSchema("Client site id (from list_sites)."),
-        collections: collectionPlanSchema,
-        confirmDestructive: z.boolean().optional().describe("Only after the user explicitly agreed to every destructive change in the plan."),
+        collections: collectionPlanSchema.describe(COLLECTIONS_PLAN_DESCRIPTION),
+        confirmDestructive: z.boolean().optional().describe("Only after the user explicitly agreed to every destructive change in the plan, e.g. true."),
       },
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Apply collection plan", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     ({ siteId, collections, confirmDestructive }) =>
       run("apply_collection_plan", async () => {
@@ -775,14 +916,21 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "add_collection_items",
     {
       title: "Add collection items",
-      description: `${COLLECTION_TOOL_DESCRIPTIONS.add_collection_items} Run with dryRun: true (the default) first; saving (dryRun: false) needs explicit confirmation. Accepts up to ${MAX_COLLECTION_ITEMS_PER_CALL} items, sent in batches; retrying the same call doesn't duplicate items.`,
+      description: `${COLLECTION_TOOL_DESCRIPTIONS.add_collection_items} Use it to move a hard-coded list (a menu array in a component, rows from a CSV) into a collection. Run with dryRun: true (the default) first; saving (dryRun: false) needs explicit confirmation. Accepts up to ${MAX_COLLECTION_ITEMS_PER_CALL} items, sent in batches; retrying the same call doesn't duplicate items.`,
       inputSchema: {
         collectionId: idSchema("Collection id (from list_collections)."),
-        items: z.array(collectionItemInputSchema).min(1).max(MAX_COLLECTION_ITEMS_PER_CALL),
-        dryRun: z.boolean().optional().describe("Validate only (default true)."),
-        mode: z.enum(["valid_only", "all_or_nothing"]).optional().describe("valid_only (default) saves the valid items; all_or_nothing saves nothing if any item is invalid."),
+        items: z
+          .array(collectionItemInputSchema)
+          .min(1)
+          .max(MAX_COLLECTION_ITEMS_PER_CALL)
+          .describe("Items to add, e.g. [{ \"values\": { \"name\": \"Margherita\", \"price\": 14 } }]."),
+        dryRun: z.boolean().optional().describe("Validate only (default true), e.g. false to save after the user confirmed."),
+        mode: z
+          .enum(["valid_only", "all_or_nothing"])
+          .optional()
+          .describe("valid_only (default) saves the valid items; all_or_nothing saves nothing if any item is invalid, e.g. \"all_or_nothing\"."),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Add collection items", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     ({ collectionId, items, dryRun, mode }) =>
       run("add_collection_items", async () => {
@@ -795,18 +943,18 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "list_collection_items",
     {
       title: "List collection items",
-      description: COLLECTION_TOOL_DESCRIPTIONS.list_collection_items,
+      description: `${COLLECTION_TOOL_DESCRIPTIONS.list_collection_items} Use it to check what's already in a collection before importing, or to find items. Up to ${COLLECTION_ITEMS_PAGE_MAX} items per call; page with offset.`,
       inputSchema: {
         collectionId: idSchema("Collection id (from list_collections)."),
-        q: z.string().max(200).optional().describe("Search titles and text fields."),
-        status: z.enum(["draft", "published"]).optional(),
-        filters: collectionItemFiltersSchema.optional(),
-        sort: z.string().max(60).optional().describe("position (default), createdAt, updatedAt, publishedAt, title, or a field key; prefix - for descending."),
-        trashed: z.boolean().optional(),
-        limit: z.number().int().min(1).max(COLLECTION_ITEMS_PAGE_MAX).optional(),
-        offset: z.number().int().min(0).optional(),
+        q: z.string().max(200).optional().describe("Search titles and text fields, e.g. \"pizza\"."),
+        status: z.enum(["draft", "published"]).optional().describe("Only drafts or only published items, e.g. \"published\"."),
+        filters: collectionItemFiltersSchema.optional().describe("Field filters, e.g. [{ \"field\": \"category\", \"value\": \"mains\" }]."),
+        sort: z.string().max(60).optional().describe("position (default), createdAt, updatedAt, publishedAt, title, or a field key; prefix - for descending, e.g. \"-updatedAt\"."),
+        trashed: z.boolean().optional().describe("List trashed items instead, e.g. true."),
+        limit: z.number().int().min(1).max(COLLECTION_ITEMS_PAGE_MAX).optional().describe(`Items per page (1–${COLLECTION_ITEMS_PAGE_MAX}), e.g. 50.`),
+        offset: z.number().int().min(0).optional().describe("Items to skip, e.g. 50 for the second page of 50."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { title: "List collection items", readOnlyHint: true, openWorldHint: false },
     },
     ({ collectionId, q, status, filters, sort, trashed, limit, offset }) =>
       run("list_collection_items", async () => {
@@ -820,9 +968,9 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "get_collection_code",
     {
       title: "Get collection code",
-      description: COLLECTION_TOOL_DESCRIPTIONS.get_collection_code,
+      description: `${COLLECTION_TOOL_DESCRIPTIONS.get_collection_code} Use it when wiring a page to read a collection, instead of guessing the response shape. Only published items reach the website.`,
       inputSchema: { collectionId: idSchema("Collection id (from list_collections).") },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { title: "Get collection code", readOnlyHint: true, openWorldHint: false },
     },
     ({ collectionId }) =>
       run("get_collection_code", async () => {
@@ -835,12 +983,12 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "undo_collection_change",
     {
       title: "Undo collection change",
-      description: `${COLLECTION_TOOL_DESCRIPTIONS.undo_collection_change} ${CONFIRM_FIRST}`,
+      description: `${COLLECTION_TOOL_DESCRIPTIONS.undo_collection_change} Use it when the user wants to revert a field or collection change. ${CONFIRM_FIRST}`,
       inputSchema: {
         collectionId: idSchema("Collection id (from list_collections)."),
         activityId: idSchema("Activity entry to undo; defaults to the most recent undoable one.").optional(),
       },
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+      annotations: { title: "Undo collection change", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
     ({ collectionId, activityId }) =>
       run("undo_collection_change", async () => {
@@ -855,16 +1003,21 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "list_feedback",
     {
       title: "List client feedback",
-      description: `Lists feedback the client left on their website (comments on elements, text changes, general notes), newest first. Defaults to open and in progress. ${FEEDBACK_TOOL_GUIDANCE.textChanges} Use get_feedback for the full context of one request.`,
+      description: `Lists feedback the client left on their website (comments on elements, text changes, general notes), newest first. Use it when the user asks to fix, review, or triage client feedback or change requests. Defaults to open and in progress. ${FEEDBACK_TOOL_GUIDANCE.textChanges} Use get_feedback for the full context of one request.`,
       inputSchema: {
         siteId: idSchema("Client site id (from list_sites)."),
-        status: z.array(z.enum(FEEDBACK_STATUSES)).min(1).max(FEEDBACK_STATUSES.length).optional().describe("Defaults to open and in_progress."),
-        type: z.enum(FEEDBACK_REQUEST_TYPES).optional(),
-        page: z.string().trim().max(200).optional().describe("Only requests on pages whose path contains this, e.g. /menu."),
-        limit: z.number().int().min(1).max(FEEDBACK_LIST_PAGE_MAX).optional(),
-        offset: z.number().int().min(0).optional(),
+        status: z
+          .array(z.enum(FEEDBACK_STATUSES))
+          .min(1)
+          .max(FEEDBACK_STATUSES.length)
+          .optional()
+          .describe("Defaults to open and in_progress, e.g. [\"done\"]."),
+        type: z.enum(FEEDBACK_REQUEST_TYPES).optional().describe("Only one kind of request, e.g. \"text_change\"."),
+        page: z.string().trim().max(200).optional().describe("Only requests on pages whose path contains this, e.g. \"/menu\"."),
+        limit: z.number().int().min(1).max(FEEDBACK_LIST_PAGE_MAX).optional().describe(`Requests per page (1–${FEEDBACK_LIST_PAGE_MAX}), e.g. 20.`),
+        offset: z.number().int().min(0).optional().describe("Requests to skip, e.g. 20 for the second page of 20."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { title: "List client feedback", readOnlyHint: true, openWorldHint: true },
     },
     ({ siteId, status, type, page, limit, offset }) =>
       run("list_feedback", async () => {
@@ -878,9 +1031,9 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "get_feedback",
     {
       title: "Get client feedback",
-      description: `Gets one feedback request with its full context: page URL, the clicked element (CSS selector, tag, nearby text, position), device and viewport, screenshot and photo URLs (temporary; fetch them to look), and the thread. ${FEEDBACK_TOOL_GUIDANCE.textChanges} ${FEEDBACK_TOOL_GUIDANCE.ambiguous}`,
+      description: `Gets one feedback request with its full context: page URL, the clicked element (CSS selector, tag, nearby text, position), device and viewport, screenshot and photo URLs, and the thread. Use it before changing code for a request. ${FEEDBACK_TOOL_GUIDANCE.textChanges} ${FEEDBACK_TOOL_GUIDANCE.ambiguous} Screenshot and photo URLs are temporary; fetch them to look.`,
       inputSchema: { requestId: idSchema("Feedback request id (from list_feedback).") },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { title: "Get client feedback", readOnlyHint: true, openWorldHint: true },
     },
     ({ requestId }) =>
       run("get_feedback", async () => {
@@ -893,12 +1046,17 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "reply_to_feedback",
     {
       title: "Reply to client feedback",
-      description: `Replies in a feedback request's thread as the signed-in user; the client gets the reply by email. ${FEEDBACK_TOOL_GUIDANCE.ambiguous} Keep replies short and plain (no code). Safe to retry: the same reply isn't posted twice.`,
+      description: `Replies in a feedback request's thread as the signed-in user; the client gets the reply by email. Use it to ask the client to clarify, or to tell them what changed. ${FEEDBACK_TOOL_GUIDANCE.ambiguous} Keep replies short and plain (no code). Safe to retry: the same reply isn't posted twice.`,
       inputSchema: {
         requestId: idSchema("Feedback request id (from list_feedback)."),
-        message: z.string().trim().min(1).max(FEEDBACK_MESSAGE_MAX_LENGTH),
+        message: z
+          .string()
+          .trim()
+          .min(1)
+          .max(FEEDBACK_MESSAGE_MAX_LENGTH)
+          .describe("The reply, e.g. \"Should the new hours apply to both locations?\"."),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Reply to client feedback", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     ({ requestId, message }) =>
       run("reply_to_feedback", async () => {
@@ -916,13 +1074,18 @@ export function createDroplServer(dependencies: ServerDependencies): McpServer {
     "update_feedback_status",
     {
       title: "Update feedback status",
-      description: `Sets a feedback request to open, in_progress, done, or wont_do. ${FEEDBACK_TOOL_GUIDANCE.markDone} Marking done emails the client; only mark done once the fix is in the code (and deployed, if the user says so).`,
+      description: `Sets a feedback request to open, in_progress, done, or wont_do. Use it after fixing a request (done) or deciding not to (wont_do). ${FEEDBACK_TOOL_GUIDANCE.markDone} Marking done emails the client; only mark done once the fix is in the code (and deployed, if the user says so).`,
       inputSchema: {
         requestId: idSchema("Feedback request id (from list_feedback)."),
-        status: z.enum(FEEDBACK_STATUSES),
-        resolutionNote: z.string().trim().max(FEEDBACK_RESOLUTION_NOTE_MAX_LENGTH).optional().describe("Short note for done or wont_do, e.g. \"Updated the opening hours on the contact page.\""),
+        status: z.enum(FEEDBACK_STATUSES).describe("New status, e.g. \"done\"."),
+        resolutionNote: z
+          .string()
+          .trim()
+          .max(FEEDBACK_RESOLUTION_NOTE_MAX_LENGTH)
+          .optional()
+          .describe("Short note for done or wont_do, e.g. \"Updated the opening hours on the contact page.\""),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Update feedback status", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
     ({ requestId, status, resolutionNote }) =>
       run("update_feedback_status", async () => {

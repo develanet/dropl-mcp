@@ -81,6 +81,10 @@ export class UploadManifest<Entry> {
     return this.document.files[fingerprint];
   }
 
+  entries(): Entry[] {
+    return Object.values(this.document.files);
+  }
+
   set(fingerprint: string, entry: Entry): void {
     this.document.files[fingerprint] = entry;
   }

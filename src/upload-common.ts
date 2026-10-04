@@ -9,6 +9,8 @@ import type { Random, Sleep } from "./retry.js";
 import type { StoragePut } from "./storage-put.js";
 
 export const MAX_LISTED_FILES = 20;
+/** Path-to-id entries listed in an upload result; past this, list_showcase_items pages through the rest. */
+export const MAX_LISTED_FILE_IDS = 100;
 const HTTP_BAD_REQUEST = 400;
 const HTTP_UNPROCESSABLE = 422;
 const FALLBACK_FILE_NAME = "upload";
@@ -68,6 +70,32 @@ export function summarizeRejected(rejected: readonly RejectedFile[]): RejectedSu
 export function summarizeFailed(failed: readonly { path: string; error: string }[]): FailedSummary {
   const listed = truncateList(failed, MAX_LISTED_FILES);
   return { count: failed.length, files: listed.items, omitted: listed.omitted };
+}
+
+/** `pending`: a dry run's files that would be uploaded. */
+export type UploadedFileStatus = "uploaded" | "already_uploaded" | "failed" | "pending";
+
+export interface UploadedFileRecord {
+  path: string;
+  /** Photos: the showcase item id. Videos: the library video id. Null until Dropl has created it. */
+  id: string | null;
+  status: UploadedFileStatus;
+  /** Videos added to a showcase: the item id there (what tag_items and update_items also accept). */
+  showcaseItemId?: string;
+  error?: string;
+}
+
+export interface UploadedFileList {
+  count: number;
+  items: UploadedFileRecord[];
+  omitted: number;
+  /** How to get the omitted entries, or null when every file is listed. */
+  more: string | null;
+}
+
+export function summarizeFileIds(records: readonly UploadedFileRecord[], moreHint: string): UploadedFileList {
+  const listed = truncateList(records, MAX_LISTED_FILE_IDS);
+  return { count: records.length, items: listed.items, omitted: listed.omitted, more: listed.omitted > 0 ? `${listed.omitted} more not listed. ${moreHint}` : null };
 }
 
 export function rejectedFromSkipped(skipped: readonly SkippedPath[]): RejectedFile[] {

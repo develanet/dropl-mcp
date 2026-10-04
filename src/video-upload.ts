@@ -32,12 +32,15 @@ import {
   isBlockingError,
   rejectedFromSkipped,
   summarizeFailed,
+  summarizeFileIds,
   summarizeRejected,
   uploadFileName,
   type FailedSummary,
   type MediaUploadContext,
   type RejectedFile,
   type RejectedSummary,
+  type UploadedFileList,
+  type UploadedFileRecord,
 } from "./upload-common.js";
 
 /** Memory stays bounded at partSizeBytes × this, since each in-flight part is read into its own buffer. */
@@ -51,6 +54,7 @@ const HTTP_FORBIDDEN = 403;
 const HTTP_NOT_FOUND = 404;
 const HTTP_SERVER_ERROR_MIN = 500;
 const FALLBACK_VIDEO_TITLE = "Untitled video";
+const MORE_VIDEO_IDS_HINT = "Call list_videos for the library, or list_showcase_items for a showcase's items with their local paths.";
 
 export interface UploadVideosInput {
   siteId: string;
@@ -81,6 +85,8 @@ export interface VideoUploadSummary {
   rejected: RejectedSummary;
   photosIgnored: number;
   showcase: { id: string; videosAdded: number; categories: { name: string; id: string; created: boolean; tagged: number }[] } | null;
+  /** Every accepted video's local path and library video id (plus its showcase item id), including ones already uploaded. */
+  files: UploadedFileList;
   stoppedReason: string | null;
   warnings: string[];
   nextSteps: string[];
@@ -391,6 +397,10 @@ export async function uploadVideos(input: UploadVideosInput, context: MediaUploa
       rejected: summarizeRejected(rejected),
       photosIgnored,
       showcase: null,
+      files: summarizeFileIds(
+        planned.map((video) => ({ path: video.file.displayPath, id: null, status: "pending" })),
+        MORE_VIDEO_IDS_HINT,
+      ),
       stoppedReason: null,
       warnings,
       nextSteps: ["Show this plan to the user and ask for confirmation, then call upload_videos again with dryRun: false."],
@@ -407,29 +417,42 @@ export async function uploadVideos(input: UploadVideosInput, context: MediaUploa
   const uploaded: (VideoRecord & { video: PlannedVideo })[] = [];
   const skipped: (VideoRecord & { video: PlannedVideo })[] = [];
   const failed: { path: string; error: string }[] = [];
+  const records = new Map<string, UploadedFileRecord>();
   let stoppedReason: string | null = null;
 
   for (const video of planned) {
+    const displayPath = video.file.displayPath;
+    const recordFailure = (error: string) => {
+      failed.push({ path: displayPath, error });
+      records.set(video.file.fingerprint, { path: displayPath, id: null, status: "failed", error });
+    };
     if (stoppedReason) {
-      failed.push({ path: video.file.displayPath, error: "Not attempted: the upload stopped early." });
+      recordFailure("Not attempted: the upload stopped early.");
       continue;
     }
     try {
       const outcome = await run.upload(video);
-      const record = { path: video.file.displayPath, title: video.title, videoId: outcome.videoId, publicId: outcome.publicId, video };
+      const record = { path: displayPath, title: video.title, videoId: outcome.videoId, publicId: outcome.publicId, video };
       (outcome.kind === "skipped" ? skipped : uploaded).push(record);
+      records.set(video.file.fingerprint, { path: displayPath, id: outcome.videoId, status: outcome.kind === "skipped" ? "already_uploaded" : "uploaded" });
     } catch (error) {
       if (context.signal?.aborted) throw error;
       const message = describeError(error);
       if (isBlockingError(error)) stoppedReason = message;
-      failed.push({ path: video.file.displayPath, error: message });
+      recordFailure(message);
     }
   }
 
   let showcase: VideoUploadSummary["showcase"] = null;
   const finished = [...uploaded, ...skipped];
   if (input.showcaseId && finished.length > 0) {
-    showcase = await addToShowcase(context, input.showcaseId, finished, warnings);
+    const added = await addToShowcase(context, input.showcaseId, finished, warnings);
+    showcase = added.summary;
+    for (const video of finished) {
+      const record = records.get(video.video.file.fingerprint);
+      const showcaseItemId = added.itemIdsByVideoId.get(video.videoId);
+      if (record && showcaseItemId) record.showcaseItemId = showcaseItemId;
+    }
   }
 
   const nextSteps: string[] = [];
@@ -452,6 +475,10 @@ export async function uploadVideos(input: UploadVideosInput, context: MediaUploa
     rejected: summarizeRejected(rejected),
     photosIgnored,
     showcase,
+    files: summarizeFileIds(
+      planned.flatMap((video) => records.get(video.file.fingerprint) ?? []),
+      MORE_VIDEO_IDS_HINT,
+    ),
     stoppedReason,
     warnings,
     nextSteps,
@@ -463,13 +490,17 @@ async function addToShowcase(
   showcaseId: string,
   videos: readonly (VideoRecord & { video: PlannedVideo })[],
   warnings: string[],
-): Promise<NonNullable<VideoUploadSummary["showcase"]>> {
+): Promise<{ summary: NonNullable<VideoUploadSummary["showcase"]>; itemIdsByVideoId: Map<string, string> }> {
   const { client } = context;
   let videosAdded = 0;
+  const itemIdsByVideoId = new Map<string, string>();
+  const rememberItems = (detail: GalleryDetail | null | undefined) => {
+    for (const item of detail?.images ?? []) if (item.video) itemIdsByVideoId.set(item.video.id, item.id);
+  };
   for (const batch of chunk(videos, MAX_GALLERY_VIDEOS_PER_REQUEST)) {
     const body: AddGalleryVideosRequest = { videoIds: batch.map((video) => video.videoId) };
     try {
-      await client.post<unknown>(`${showcasePath(showcaseId)}/videos`, body, { signal: context.signal });
+      rememberItems(await client.post<GalleryDetail>(`${showcasePath(showcaseId)}/videos`, body, { signal: context.signal }));
       videosAdded += batch.length;
     } catch (error) {
       warnings.push(`Couldn't add ${batch.length} videos to the showcase: ${describeError(error)} Use add_videos_to_showcase to retry.`);
@@ -478,10 +509,12 @@ async function addToShowcase(
 
   const categoryNames = [...new Set(videos.flatMap((video) => video.video.categoryNames))];
   const categorySummaries: NonNullable<VideoUploadSummary["showcase"]>["categories"] = [];
-  if (categoryNames.length === 0 || videosAdded === 0) return { id: showcaseId, videosAdded, categories: categorySummaries };
+  const result = () => ({ summary: { id: showcaseId, videosAdded, categories: categorySummaries }, itemIdsByVideoId });
+  if (categoryNames.length === 0 || videosAdded === 0) return result();
 
   try {
     const detail = await client.get<GalleryDetail>(showcasePath(showcaseId), { signal: context.signal });
+    rememberItems(detail);
     const categories = await ensureCategories(client, showcaseId, categoryNames, detail.categories);
     const itemsByVideoId = new Map(detail.images.filter((item) => item.video).map((item) => [item.video!.id, item]));
     for (const category of categories.values()) {
@@ -496,5 +529,5 @@ async function addToShowcase(
   } catch (error) {
     warnings.push(`Couldn't tag the videos: ${describeError(error)} Use tag_items to retry.`);
   }
-  return { id: showcaseId, videosAdded, categories: categorySummaries };
+  return result();
 }

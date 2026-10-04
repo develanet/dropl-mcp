@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { ALT_TEXT_GUIDANCE, GALLERY_IMAGE_ALT_MAX_LENGTH } from "@dropl/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createDroplServer, normalizeSiteDomain } from "../src/server.js";
 import { makeTempDirectory, removeDirectory, uniqueJpeg, writeFiles } from "./helpers/fixtures.js";
@@ -12,6 +13,8 @@ const EXPECTED_TOOLS = [
   "list_showcases",
   "create_showcase",
   "get_showcase",
+  "list_showcase_items",
+  "update_items",
   "update_showcase",
   "create_category",
   "tag_items",
@@ -99,6 +102,78 @@ describe("MCP server", () => {
     expect(instructions).toContain("Never ask the user to paste an API key");
     expect(instructions).toContain("get_embed_code");
     expect(instructions).toContain("build");
+    expect(instructions).toContain("update_items");
+    expect(instructions).toContain('without "image of"');
+  });
+
+  it("describes the id, alt text and per-file inputs and outputs in the tool schemas", async () => {
+    const client = await connect({});
+    const { tools } = await client.listTools();
+    const tool = (name: string) => tools.find((candidate) => candidate.name === name)!;
+    const properties = (name: string) => tool(name).inputSchema.properties as Record<string, any>;
+
+    const upload = tool("upload_photos");
+    expect(upload.inputSchema.required).toEqual(["showcaseId"]);
+    expect(properties("upload_photos").paths.type).toBe("array");
+    const fileItem = properties("upload_photos").files.items;
+    expect(Object.keys(fileItem.properties)).toEqual(["path", "alt", "categories"]);
+    expect(fileItem.required).toEqual(["path"]);
+    expect(fileItem.properties.alt.anyOf).toEqual(expect.arrayContaining([expect.objectContaining({ type: "string", maxLength: GALLERY_IMAGE_ALT_MAX_LENGTH }), { type: "null" }]));
+    expect(upload.description).toMatch(/files: each local path with its showcase item id/);
+    expect(upload.description).toContain(ALT_TEXT_GUIDANCE);
+
+    const update = tool("update_items");
+    expect(update.inputSchema.required).toEqual(["showcaseId", "items"]);
+    const updateItem = properties("update_items").items.items;
+    expect(updateItem.required).toEqual(["id"]);
+    expect(Object.keys(updateItem.properties)).toEqual(["id", "alt", "addCategories", "removeCategories"]);
+    expect(update.description).toContain(ALT_TEXT_GUIDANCE);
+    expect(update.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: true });
+
+    expect(Object.keys(properties("list_showcase_items"))).toEqual(["showcaseId", "kind", "missingAlt", "category", "search", "offset", "limit"]);
+    expect(tool("list_showcase_items").annotations).toMatchObject({ readOnlyHint: true });
+    expect(tool("tag_items").description).toMatch(/files\[\]\.id/);
+  });
+
+  it("uploads with per-file alt text, then tags, updates and lists items by the returned ids", async () => {
+    const client = await connect({ DROPL_API_KEY: TEST_API_KEY });
+    const showcase = api.addShowcase();
+    await writeFiles(home, { "media/deck.jpg": uniqueJpeg(1), "media/patio.jpg": uniqueJpeg(2) });
+
+    const upload = await call(client, "upload_photos", {
+      showcaseId: showcase.id,
+      paths: ["media"],
+      cwd: home,
+      files: [{ path: "media/deck.jpg", alt: "Cedar deck at dusk", categories: ["Decks"] }],
+    });
+    expect(upload.result.isError).toBeFalsy();
+    expect(upload.data).toMatchObject({ uploaded: 2, altTextSet: 1, files: { count: 2, omitted: 0 } });
+    const [deck, patio] = upload.data.files.items;
+    expect(deck).toMatchObject({ path: "media/deck.jpg", status: "uploaded" });
+    expect(patio).toMatchObject({ path: "media/patio.jpg", status: "uploaded" });
+
+    const tagged = await call(client, "tag_items", { showcaseId: showcase.id, itemIds: [patio.id], addCategoryNames: ["Patios"] });
+    expect(tagged.data).toMatchObject({ tagged: 1, createdCategories: ["Patios"] });
+    const unknown = await call(client, "tag_items", { showcaseId: showcase.id, itemIds: ["missing-id"], addCategoryNames: ["Patios"] });
+    expect(unknown.result.isError).toBe(true);
+    expect(unknown.data).toMatch(/missing-id/);
+
+    const updated = await call(client, "update_items", { showcaseId: showcase.id, items: [{ id: patio.id, alt: "Stone patio with fire pit" }] });
+    expect(updated.data).toMatchObject({ updated: 1, altTextSet: 1, items: [{ id: patio.id, alt: "Stone patio with fire pit", categories: ["Patios"] }] });
+    const nothing = await call(client, "update_items", { showcaseId: showcase.id, items: [{ id: patio.id }] });
+    expect(nothing.result.isError).toBe(true);
+    const tooLong = await call(client, "update_items", { showcaseId: showcase.id, items: [{ id: patio.id, alt: "x".repeat(GALLERY_IMAGE_ALT_MAX_LENGTH + 1) }] });
+    expect(tooLong.result.isError).toBe(true);
+
+    const listed = await call(client, "list_showcase_items", { showcaseId: showcase.id });
+    expect(listed.data).toMatchObject({ total: 2, photosWithoutAltText: 0, nextOffset: null });
+    expect(listed.data.items).toEqual([
+      expect.objectContaining({ id: deck.id, alt: "Cedar deck at dusk", categories: ["Decks"], localPath: expect.stringMatching(/media\/deck\.jpg$/) }),
+      expect.objectContaining({ id: patio.id, alt: "Stone patio with fire pit", categories: ["Patios"], localPath: expect.stringMatching(/media\/patio\.jpg$/) }),
+    ]);
+
+    const detail = await call(client, "get_showcase", { showcaseId: showcase.id });
+    expect(detail.data).toMatchObject({ photosWithoutAltText: 0, uncategorized: 0 });
   });
 
   it("tells the agent how to sign in when there are no credentials", async () => {

@@ -1,8 +1,37 @@
 {
   "name": "@dropl/mcp",
-  "version": "0.5.0",
-  "description": "MCP server that lets AI coding agents create Dropl client sites and showcases, upload photos and videos, and fetch embed code.",
+  "version": "0.6.0",
+  "description": "Create client-editable photo and video galleries from Cursor or Claude Code, then embed them.",
+  "mcpName": "io.dropl/mcp",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "cursor",
+    "claude",
+    "claude-code",
+    "ai-agent",
+    "photo-gallery",
+    "video-hosting",
+    "gallery-embed",
+    "client-portal",
+    "nextjs",
+    "webflow",
+    "framer",
+    "wordpress",
+    "headless-cms",
+    "dropl"
+  ],
+  "homepage": "https://www.dropl.io/mcp",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/develanet/dropl-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/develanet/dropl-mcp/issues"
+  },
   "license": "MIT",
+  "author": "Dropl (https://www.dropl.io)",
   "type": "module",
   "bin": {
     "dropl-mcp": "dist/cli.js"
@@ -13,7 +42,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=20.3"
   },
   "publishConfig": {
     "access": "public"
@@ -22,6 +51,9 @@
     "build": "tsup",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "sync-version": "node scripts/sync-version.mjs",
+    "check:tools": "node scripts/check-tools.mjs",
+    "prepublishOnly": "node scripts/sync-version.mjs && npm run build && node scripts/check-tools.mjs",
     "clean": "rm -rf dist .turbo"
   },
   "dependencies": {

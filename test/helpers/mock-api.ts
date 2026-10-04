@@ -386,6 +386,25 @@ export class MockDroplApi {
         for (const category of showcase.categories) category.itemCount = showcase.images.filter((image) => image.categoryIds.includes(category.id)).length;
         return [200, { updated: body.imageIds.length }];
       }
+      if (rest === "/items" && method === "PATCH") {
+        const changes: { id: string; altText?: string | null; addCategoryIds?: string[]; removeCategoryIds?: string[] }[] = body.items;
+        const items = changes.map((change) => showcase.images.find((image) => image.id === change.id));
+        if (items.some((item) => !item)) return [404, { error: { code: "IMAGE_NOT_FOUND", message: "Item not found." } }];
+        const categoryIds = new Set(showcase.categories.map((category) => category.id));
+        if (changes.some((change) => [...(change.addCategoryIds ?? []), ...(change.removeCategoryIds ?? [])].some((id) => !categoryIds.has(id)))) {
+          return [404, { error: { code: "CATEGORY_NOT_FOUND", message: "Category not found." } }];
+        }
+        changes.forEach((change, index) => {
+          const item = items[index]!;
+          if (change.altText !== undefined) item.altText = change.altText?.trim() || null;
+          const ids = new Set(item.categoryIds);
+          for (const id of change.addCategoryIds ?? []) ids.add(id);
+          for (const id of change.removeCategoryIds ?? []) ids.delete(id);
+          item.categoryIds = [...ids];
+        });
+        for (const category of showcase.categories) category.itemCount = showcase.images.filter((image) => image.categoryIds.includes(category.id)).length;
+        return [200, { items }];
+      }
       if (rest === "/videos" && method === "POST") {
         for (const videoId of body.videoIds) {
           const video = this.videos.get(videoId);
@@ -400,9 +419,9 @@ export class MockDroplApi {
         return [200, showcase];
       }
       if (rest === "/photos/uploads" && method === "POST") {
-        const uploads = body.files.map((file: { fileName: string; contentType: string }) => {
+        const uploads = body.files.map((file: { fileName: string; contentType: string; altText?: string | null }) => {
           const imageId = nextId("img");
-          showcase.images.push(photoItem(imageId, file.fileName, showcase.images.length));
+          showcase.images.push({ ...photoItem(imageId, file.fileName, showcase.images.length), altText: file.altText || null });
           return { imageId, uploadUrl: `${this.origin}/storage/photo/${imageId}`, headers: { "Content-Type": file.contentType } };
         });
         return [201, { uploads, expiresAt: new Date(Date.now() + 3_600_000).toISOString() }];

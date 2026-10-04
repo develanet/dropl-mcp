@@ -1,0 +1,32 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.dropl/mcp",
+  "title": "Dropl MCP",
+  "description": "Create client-editable photo and video galleries from Cursor or Claude Code, then embed them.",
+  "websiteUrl": "https://www.dropl.io/mcp",
+  "repository": {
+    "url": "https://github.com/develanet/dropl-mcp",
+    "source": "github"
+  },
+  "version": "0.6.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@dropl/mcp",
+      "version": "0.6.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "DROPL_API_KEY",
+          "description": "Optional. Dropl API key; overrides the saved browser sign-in.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
