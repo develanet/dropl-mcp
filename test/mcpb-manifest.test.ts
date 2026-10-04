@@ -5,13 +5,16 @@ import { describe, expect, it } from "vitest";
 import { API_KEY_ENV } from "../src/config.js";
 import { LONG_DESCRIPTION, SHORT_DESCRIPTION, WEBSITE_URL } from "../src/metadata.js";
 import { createDroplServer } from "../src/server.js";
+import { PACKAGE_NAME } from "../src/version.js";
+import { buildSmitheryPayload, type ServerCard } from "../scripts/smithery-payload.mjs";
 import { makeTempDirectory, removeDirectory } from "./helpers/fixtures.js";
 
 const MIRROR_REPOSITORY_URL = "https://github.com/develanet/dropl-mcp";
 const BUNDLE_OUTPUT_DIRECTORY = "build";
 const readJson = async (relativePath: string) => JSON.parse(await readFile(new URL(relativePath, import.meta.url), "utf8"));
 
-async function registeredToolNames(): Promise<string[]> {
+/** What bundle-mcpb.mjs reads from the staged server over stdio, read here in memory from the same source. */
+async function inMemoryServerCard(): Promise<ServerCard> {
   const home = await makeTempDirectory();
   try {
     const server = createDroplServer({ platform: { env: { XDG_CONFIG_HOME: home }, platform: process.platform, homeDirectory: home }, log: () => undefined });
@@ -20,11 +23,16 @@ async function registeredToolNames(): Promise<string[]> {
     const client = new Client({ name: "mcpb-manifest-test", version: "1.0.0" });
     await client.connect(clientTransport);
     const { tools } = await client.listTools();
+    const serverInfo = client.getServerVersion();
     await client.close();
-    return tools.map((tool) => tool.name);
+    return { serverInfo, tools };
   } finally {
     await removeDirectory(home);
   }
+}
+
+async function registeredToolNames(): Promise<string[]> {
+  return (await inMemoryServerCard()).tools.map((tool) => tool.name);
 }
 
 describe("MCPB bundle manifest (Claude Desktop and Smithery)", () => {
@@ -75,5 +83,35 @@ describe("MCPB bundle manifest (Claude Desktop and Smithery)", () => {
     const packageJson = await readJson("../package.json");
     expect(packageJson.files).not.toContain(BUNDLE_OUTPUT_DIRECTORY);
     expect(packageJson.files).not.toContain("manifest.json");
+  });
+});
+
+describe("Smithery release payload", () => {
+  it("sends the server's full tools (with inputSchema) and the API key setting as configSchema", async () => {
+    const manifest = await readJson("../manifest.json");
+    const serverCard = await inMemoryServerCard();
+    const payload = buildSmitheryPayload(manifest, serverCard);
+
+    expect(payload).toMatchObject({ type: "stdio", runtime: "node", serverCard: { serverInfo: { name: PACKAGE_NAME, version: manifest.version } } });
+    expect(payload.serverCard.tools).toHaveLength(manifest.tools.length);
+    for (const tool of payload.serverCard.tools) expect(tool.inputSchema.type, tool.name).toBe("object");
+    expect(payload.configSchema).toEqual({
+      type: "object",
+      properties: { api_key: { type: "string", title: manifest.user_config.api_key.title, description: manifest.user_config.api_key.description, default: "" } },
+      required: [],
+    });
+  });
+
+  it("rejects the card `smithery mcp publish` builds from manifest.json (tools without inputSchema)", async () => {
+    const manifest = await readJson("../manifest.json");
+    const { serverInfo } = await inMemoryServerCard();
+    expect(() => buildSmitheryPayload(manifest, { serverInfo, tools: manifest.tools })).toThrow(/isn't a valid MCP tool/);
+  });
+
+  it("rejects a card that drifted from manifest.json's tools or version", async () => {
+    const manifest = await readJson("../manifest.json");
+    const serverCard = await inMemoryServerCard();
+    expect(() => buildSmitheryPayload(manifest, { ...serverCard, tools: serverCard.tools.slice(1) })).toThrow(/manifest\.json lists/);
+    expect(() => buildSmitheryPayload({ ...manifest, version: "0.0.0" }, serverCard)).toThrow(/reports version/);
   });
 });

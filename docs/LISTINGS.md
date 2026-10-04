@@ -20,7 +20,7 @@ Submission URLs were checked on 2026-10-03.
 | Official MCP Registry | `mcp-publisher publish` (see below); browse at https://registry.modelcontextprotocol.io | 2026-10-04 | Live: `io.dropl/mcp` 0.6.0, active, latest. |
 | Glama | https://glama.ai/mcp/servers | | Not listed. No submit form; Glama indexes public GitHub repos. Once the public mirror is indexed, claim the listing from its page. |
 | PulseMCP | https://www.pulsemcp.com/submit | | Not listed. Submissions paused (page updated 2026-09-03); PulseMCP says it picks up servers from the official registry. |
-| Smithery | https://smithery.ai/new, or `smithery mcp publish` (see below) | | Not listed. Bundle ready: publish `build/dropl.mcpb` as `isaias/dropl` (a local stdio bundle; URL publishing doesn't fit because the server uploads files from the user's disk). Needs a Smithery sign-in. |
+| Smithery | `pnpm --filter @dropl/mcp publish:smithery --name isaias/dropl` (see below) | | Not listed. Bundle ready: publish `build/dropl.mcpb` as `isaias/dropl` (a local stdio bundle; URL publishing doesn't fit because the server uploads files from the user's disk). `smithery mcp publish` was rejected on 2026-10-03 (tools without `inputSchema`); use the script. Needs a Smithery API key. |
 | mcp.so | https://mcp.so/submit | | Not listed. |
 | MCP Market | https://mcpmarket.com/submit | | Not listed. |
 | awesome-mcp-servers (punkpeye) | https://github.com/punkpeye/awesome-mcp-servers (pull request adding one line to the README) | | Not submitted. Follow the repo's CONTRIBUTING notes for the category and line format. |
@@ -71,13 +71,13 @@ Build it from the monorepo root (the mirror can't build it; see Public mirror):
 pnpm --filter @dropl/mcp bundle
 ```
 
-That stages `packages/mcp/build/mcpb/` and writes `packages/mcp/build/dropl.mcpb` (about 300 kB; `build/` is gitignored and isn't in the npm tarball). `mcpb pack` validates the manifest; to check it on its own, run `pnpm --filter @dropl/mcp exec mcpb validate manifest.json`. To try it locally, open the `.mcpb` file with Claude Desktop.
+That stages `packages/mcp/build/mcpb/` and writes `packages/mcp/build/dropl.mcpb` (about 300 kB; `build/` is gitignored and isn't in the npm tarball). It also starts the staged server over stdio and writes its `initialize` + `tools/list` result to `build/server-card.json`, failing if the tools differ from `manifest.json`. `mcpb pack` validates the manifest; to check it on its own, run `pnpm --filter @dropl/mcp exec mcpb validate manifest.json`. To try it locally, open the `.mcpb` file with Claude Desktop.
 
-Publish to Smithery from `packages/mcp`, either by uploading `build/dropl.mcpb` at https://smithery.ai/new or with the CLI:
+Publish to Smithery with `scripts/publish-smithery.mjs`, not `smithery mcp publish`. The Smithery CLI (4.11.1) copies `manifest.json`'s `tools` into the release's server card, and the MCPB 0.3 schema only allows a name and description there, while Smithery requires each tool's `inputSchema`; the API rejects that release with one `Invalid input: expected object, received undefined` per tool. The script uploads the same `build/dropl.mcpb` with the full server card from `build/server-card.json`, using the same API calls as the CLI. It reads a Smithery API key (https://smithery.ai/account/api-keys) from `SMITHERY_API_KEY` only:
 
 ```sh
-npx -y @smithery/cli@latest auth login
-npx -y @smithery/cli@latest mcp publish ./build/dropl.mcpb -n isaias/dropl
+pnpm --filter @dropl/mcp publish:smithery --name isaias/dropl --dry-run   # checks the payload, writes build/smithery-payload.json, sends nothing
+SMITHERY_API_KEY=… pnpm --filter @dropl/mcp publish:smithery --name isaias/dropl
 ```
 
 On each release, bump `version` in `package.json` and run `pnpm --filter @dropl/mcp sync-version`: it writes the same version into `server.json`, `manifest.json`, and `plugin.json` (`--check` fails instead, for CI). Only `manifest.json`'s `tools` list needs a manual edit when tools change. `test/mcpb-manifest.test.ts` fails if the version or the tools drift, and the bundle script refuses a version mismatch.

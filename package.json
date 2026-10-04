@@ -54,6 +54,7 @@
     "sync-version": "node scripts/sync-version.mjs",
     "check:tools": "node scripts/check-tools.mjs",
     "bundle": "node scripts/bundle-mcpb.mjs && mcpb pack build/mcpb build/dropl.mcpb",
+    "publish:smithery": "node scripts/publish-smithery.mjs",
     "prepublishOnly": "node scripts/sync-version.mjs && npm run build && node scripts/check-tools.mjs",
     "clean": "rm -rf dist build .turbo"
   },
@@ -66,6 +67,7 @@
     "@anthropic-ai/mcpb": "^2.1.2",
     "@dropl/shared": "workspace:*",
     "@dropl/typescript-config": "workspace:*",
+    "@smithery/api": "^0.68.0",
     "@types/node": "^24.19.0",
     "@types/picomatch": "^4.0.3",
     "tsup": "^8.5.1",

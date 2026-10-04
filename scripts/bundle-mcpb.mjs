@@ -2,7 +2,8 @@
 /*
  * Stages the MCP Bundle (.mcpb) for Claude Desktop and Smithery in build/mcpb: manifest.json, icon.png, LICENSE,
  * a dependency-free package.json, and server/index.js, one ESM file with every dependency bundled (no
- * node_modules to ship). `pnpm bundle` then validates the staged manifest and packs build/dropl.mcpb.
+ * node_modules to ship). It also writes build/server-card.json for publish-smithery.mjs (see smithery-payload.mjs).
+ * `pnpm bundle` then validates the staged manifest and packs build/dropl.mcpb.
  *
  * server/index.js sits one level below package.json, the same layout as dist/cli.js, because src/version.ts
  * reads the version from "../package.json" at startup.
@@ -10,9 +11,12 @@
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { build } from "tsup";
+import { buildSmitheryPayload, readServerCard } from "./smithery-payload.mjs";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const stagingUrl = new URL("../build/mcpb/", import.meta.url);
+/** Outside the staging folder, so it isn't packed into the bundle. */
+const serverCardUrl = new URL("../build/server-card.json", import.meta.url);
 const stagingDirectory = fileURLToPath(stagingUrl);
 const SERVER_DIRECTORY_NAME = "server";
 const SERVER_ENTRY_NAME = "index";
@@ -66,4 +70,10 @@ const bundlePackageJson = {
 await writeFile(new URL("package.json", stagingUrl), `${JSON.stringify(bundlePackageJson, null, 2)}\n`);
 for (const fileName of COPIED_FILES) await copyFile(new URL(`../${fileName}`, import.meta.url), new URL(fileName, stagingUrl));
 
+// Smithery's server card, read from the staged server itself; buildSmitheryPayload fails on any drift from manifest.json.
+const serverCard = await readServerCard(fileURLToPath(new URL(expectedEntryPoint, stagingUrl)), packageJson.version);
+buildSmitheryPayload(manifest, serverCard);
+await writeFile(serverCardUrl, `${JSON.stringify(serverCard, null, 2)}\n`);
+
 console.log(`Staged ${packageJson.name} ${packageJson.version} in ${stagingDirectory}`);
+console.log(`Wrote the Smithery server card (${serverCard.tools.length} tools) to ${fileURLToPath(serverCardUrl)}`);
